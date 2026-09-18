@@ -70,6 +70,20 @@ def index(auth: bool = Depends(check_auth)):
     return UPLOAD_FORM
 
 
+def pick_fallback(to_addr, from_addr, sheet_parcel, notes):
+    """Cheapest of the fallback carriers using the sheet's real weight/dims."""
+    try:
+        rates = gori_client.get_rates(to_addr, from_addr, sheet_parcel)
+    except Exception as e:
+        return None, sheet_parcel, None, notes + [f"Rate lookup failed: {e}"]
+
+    candidates = [r for r in rates if r.get("service") in FALLBACK_SERVICES and "fees" in r]
+    if not candidates:
+        return None, sheet_parcel, None, notes + ["No fallback carrier available for this address/parcel"]
+    best = min(candidates, key=lambda r: r["fees"]["amount"])
+    return best["service"], sheet_parcel, best["fees"]["amount"], notes
+
+
 def pick_service_and_parcel(to_addr, from_addr, sheet_parcel):
     """Returns (service, parcel_dict, rate_amount, notes)."""
     notes = []
@@ -84,16 +98,7 @@ def pick_service_and_parcel(to_addr, from_addr, sheet_parcel):
         return "gofo_ground", GOFO_OVERRIDE_PARCEL, gofo["fees"]["amount"], notes
 
     notes.append("GOFO Ground unavailable, falling back to cheapest of USPS/UPS Ground Saver/FedEx")
-    try:
-        rates = gori_client.get_rates(to_addr, from_addr, sheet_parcel)
-    except Exception as e:
-        return None, sheet_parcel, None, notes + [f"Rate lookup failed: {e}"]
-
-    candidates = [r for r in rates if r.get("service") in FALLBACK_SERVICES and "fees" in r]
-    if not candidates:
-        return None, sheet_parcel, None, notes + ["No fallback carrier available for this address/parcel"]
-    best = min(candidates, key=lambda r: r["fees"]["amount"])
-    return best["service"], sheet_parcel, best["fees"]["amount"], notes
+    return pick_fallback(to_addr, from_addr, sheet_parcel, notes)
 
 
 @app.post("/upload", response_class=HTMLResponse)
@@ -124,15 +129,45 @@ async def upload(auth: bool = Depends(check_auth), file: UploadFile = File(...))
                 r["message"] = "No carrier available (GOFO and all fallbacks failed)"
                 results.append(r)
                 continue
-            shipment = gori_client.create_shipment(
-                service=service,
-                to_address=row["to_address"],
-                from_address=row["from_address"],
-                parcel=parcel,
-                reference_1=row["reference_1"],
-                reference_2=row["reference_2"],
-            )
-            label_url = shipment.get("label_url") or shipment.get("label_pdf_url") or shipment.get("label")
+
+            try:
+                shipment = gori_client.create_shipment(
+                    service=service,
+                    to_address=row["to_address"],
+                    from_address=row["from_address"],
+                    parcel=parcel,
+                    reference_1=row["reference_1"],
+                    reference_2=row["reference_2"],
+                )
+            except Exception as e:
+                if service == "gofo_ground":
+                    # GOFO sometimes quotes fine but fails at actual booking time
+                    # (provider-side issue) - fall back to the next best carrier.
+                    r["fixes"].append(f"GOFO Ground booking failed ({e}), falling back to cheapest of USPS/UPS Ground Saver/FedEx")
+                    service, parcel, amount, fb_notes = pick_fallback(
+                        row["to_address"], row["from_address"], row["sheet_parcel_oz_in"], []
+                    )
+                    r["fixes"] = r["fixes"] + fb_notes
+                    if not service:
+                        r["status"] = "error"
+                        r["message"] = "GOFO booking failed and no fallback carrier available"
+                        results.append(r)
+                        continue
+                    shipment = gori_client.create_shipment(
+                        service=service,
+                        to_address=row["to_address"],
+                        from_address=row["from_address"],
+                        parcel=parcel,
+                        reference_1=row["reference_1"],
+                        reference_2=row["reference_2"],
+                    )
+                else:
+                    raise
+
+            label_info = shipment.get("label") or {}
+            label_url = (
+                label_info.get("image_url") if isinstance(label_info, dict) else label_info
+            ) or shipment.get("label_url") or shipment.get("label_pdf_url")
             tracking = shipment.get("tracking_code") or shipment.get("tracking_number")
             r["status"] = "ok"
             r["service"] = service
@@ -213,18 +248,3 @@ def download_pdf(auth: bool = Depends(check_auth)):
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-
-@app.get("/debug-rates")
-def debug_rates(auth: bool = Depends(check_auth)):
-    """Temporary diagnostic: confirm gori_client.get_rates (via the gori-mcp
-    JSON-RPC proxy) returns real rates end-to-end."""
-    to_address = {"street1": "316 Embrey Mill Rd", "city": "Stafford", "state": "VA", "zip": "22554-2577", "country": "US", "first_name": "Test", "last_name": "Test"}
-    from_address = {"street1": "2550 Southwell Rd", "city": "Dallas", "state": "TX", "zip": "75229", "country": "US", "company": "SHIPPING DEPT"}
-    parcel = {"length": 6, "width": 4, "height": 4, "weight": 4}
-    try:
-        rates = gori_client.get_rates(to_address, from_address, parcel)
-        gofo = next((r for r in rates if r.get("carrier") == "gofo" and r.get("service") == "gofo_ground" and "fees" in r), None)
-        return {"ok": True, "num_rates": len(rates), "gofo_rate": gofo, "all_rates": rates}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
