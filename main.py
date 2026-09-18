@@ -16,7 +16,7 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "changeme")
 APP_USERNAME = os.environ.get("APP_USERNAME", "vikaas")
 
 GOFO_OVERRIDE_PARCEL = {"weight": 4.0, "length": 6.0, "width": 4.0, "height": 4.0}
-FALLBACK_SERVICES = ["ground_advantage", "ground_saver", "ground"]
+FALLBACK_SERVICES = ["usps_ground_advantage", "ups_ground_saver", "fedex_home_delivery"]
 
 app = FastAPI(title="Gori Label Batch Uploader")
 security = HTTPBasic()
@@ -217,46 +217,33 @@ def health():
 
 @app.get("/debug-rates")
 def debug_rates(auth: bool = Depends(check_auth)):
-    """Temporary diagnostic: confirm the fixed /shipments/rates path works."""
-    import datetime
-    today = datetime.date.today().isoformat()
+    """Temporary diagnostic: test calling the gori-mcp server's own MCP endpoint
+    directly (server-to-server), since that server reliably gets real rates/labels
+    for the exact same inputs that fail against api.goricompany.com directly."""
+    to_address = {"street1": "316 Embrey Mill Rd", "city": "Stafford", "state": "VA", "zip": "22554-2577", "country": "US", "first_name": "Test", "last_name": "Test"}
+    from_address = {"street1": "2550 Southwell Rd", "city": "Dallas", "state": "TX", "zip": "75229", "country": "US", "company": "SHIPPING DEPT"}
     parcel = {"length": 6, "width": 4, "height": 4, "weight": 4}
-    results = []
 
-    variants = {
-        "first_last_no_ship_date": (
-            {"street1": "316 Embrey Mill Rd", "city": "Stafford", "state": "VA", "zip": "22554-2577", "country": "US", "first_name": "Test", "last_name": "Test"},
-            {"street1": "2550 Southwell Rd", "city": "Dallas", "state": "TX", "zip": "75229", "country": "US", "company": "SHIPPING DEPT"},
-            {},
-        ),
-        "name_field_no_ship_date": (
-            {"street1": "316 Embrey Mill Rd", "city": "Stafford", "state": "VA", "zip": "22554-2577", "country": "US", "name": "Test Test"},
-            {"street1": "2550 Southwell Rd", "city": "Dallas", "state": "TX", "zip": "75229", "country": "US", "name": "SHIPPING DEPT"},
-            {},
-        ),
-        "name_field_with_ship_date": (
-            {"street1": "316 Embrey Mill Rd", "city": "Stafford", "state": "VA", "zip": "22554-2577", "country": "US", "name": "Test Test"},
-            {"street1": "2550 Southwell Rd", "city": "Dallas", "state": "TX", "zip": "75229", "country": "US", "name": "SHIPPING DEPT"},
-            {"ship_date": today},
-        ),
-        "first_last_with_ship_date": (
-            {"street1": "316 Embrey Mill Rd", "city": "Stafford", "state": "VA", "zip": "22554-2577", "country": "US", "first_name": "Test", "last_name": "Test"},
-            {"street1": "2550 Southwell Rd", "city": "Dallas", "state": "TX", "zip": "75229", "country": "US", "company": "SHIPPING DEPT"},
-            {"ship_date": today},
-        ),
+    mcp_url = "https://gori-mcp-production.up.railway.app/mcp"
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "get_rates",
+            "arguments": {"to_address": to_address, "from_address": from_address, "parcel": parcel},
+        },
     }
-
-    for name, (to_addr, from_addr, extra) in variants.items():
-        try:
-            body = {"to_address": to_addr, "from_address": from_addr, "parcel": parcel, **extra}
-            resp = requests.post(
-                f"{gori_client.GORI_BASE_URL}/shipments/rates",
-                headers=gori_client._headers(),
-                json=body,
-                timeout=30,
-            )
-            results.append({"variant": name, "status": resp.status_code, "body": resp.text[:800]})
-        except Exception as e:
-            results.append({"variant": name, "error": str(e)})
+    results = []
+    try:
+        resp = requests.post(
+            mcp_url,
+            json=payload,
+            headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+            timeout=30,
+        )
+        results.append({"variant": "gori-mcp tools/call get_rates", "status": resp.status_code, "content_type": resp.headers.get("content-type"), "body": resp.text[:2000]})
+    except Exception as e:
+        results.append({"variant": "gori-mcp tools/call get_rates", "error": str(e)})
 
     return results
