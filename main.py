@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 import gori_client
+import gofo_client
 from csv_fixer import parse_and_fix
 from pdf_builder import build_batch_pdf
 
@@ -684,3 +685,15 @@ def get_pdf(pdf_token: str, auth: bool = Depends(check_auth)):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# TEMPORARY: direct GOFO speed/correctness test. Not linked from the UI -
+# hit it manually while validating the direct-GOFO coverage check. Remove
+# once we've confirmed it and wired the real check into pricing.
+# ---------------------------------------------------------------------------
+@app.get("/debug/gofo-verify")
+def debug_gofo_verify(zip: str, state: str = "", city: str = "", country: str = "US",
+                       auth: bool = Depends(check_auth)):
+    result = gofo_client.verify_delivery(country=country, state=state, city=city, postal_code=zip)
+    return result
