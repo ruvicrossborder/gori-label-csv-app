@@ -303,11 +303,8 @@ def debug_rates(auth: bool = Depends(check_auth)):
 
         shipments_url = "https://api.goricompany.com/v2/shipments"
         post_variants = {
-            "no_service": {"to_address": to_named, "from_address": from_named, "parcel": parcel},
-            "carrier_all": {"to_address": to_named, "from_address": from_named, "parcel": parcel, "carrier": "all"},
-            "rate_true": {"to_address": to_named, "from_address": from_named, "parcel": parcel, "rate": True},
-            "quote_true": {"to_address": to_named, "from_address": from_named, "parcel": parcel, "quote": True},
-            "with_service_ground_advantage": {"to_address": to_named, "from_address": from_named, "parcel": parcel, "service": "ground_advantage"},
+            "rates_no_service_ship_date": {"to_address": to_named, "from_address": from_named, "parcel": parcel, "ship_date": today},
+            "rates_carrier_all_ship_date": {"to_address": to_named, "from_address": from_named, "parcel": parcel, "carrier": "all", "ship_date": today},
         }
         for name, b in post_variants.items():
             try:
@@ -315,5 +312,13 @@ def debug_rates(auth: bool = Depends(check_auth)):
                 results.append({"variant": f"POST_shipments_{name}", "status": resp.status_code, "body": resp.text[:500]})
             except Exception as e:
                 results.append({"variant": f"POST_shipments_{name}", "error": str(e)})
+
+        # also retry /v2/rates with ship_date now
+        try:
+            rate_body = {"to_address": to_named, "from_address": from_named, "parcel": parcel, "ship_date": today}
+            resp = requests.post(url, headers=headers, json=rate_body, timeout=15)
+            results.append({"variant": "rates_with_name_and_ship_date", "status": resp.status_code, "body": resp.text[:600]})
+        except Exception as e:
+            results.append({"variant": "rates_with_name_and_ship_date", "error": str(e)})
 
     return results
