@@ -4,7 +4,7 @@ import uuid
 import secrets
 import datetime
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -37,8 +37,11 @@ _RESULTS = {}   # token -> {"status": "processing"|"done"|"error", ...}
 
 # Rows are independent of each other, so rate lookups / label creation for a
 # whole batch are fanned out across a small thread pool instead of running
-# one row at a time - a 60+ row batch was otherwise taking minutes.
-_MAX_WORKERS = 12
+# one row at a time - a 60+ row batch was otherwise taking minutes. Kept
+# modest (rather than higher) because gori-mcp itself appears to queue up or
+# stall when hit with too many concurrent requests - a wide pool made things
+# slower, not faster, once a handful of calls started timing out.
+_MAX_WORKERS = 6
 
 
 def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
@@ -162,18 +165,28 @@ document.getElementById('uploadForm').addEventListener('submit', function(){
 """
 
 
-def waiting_page(poll_url, message):
+def waiting_page(poll_url, message, done=None, total=None):
     """A lightweight page that auto-refreshes itself until the background job
     behind poll_url is done. Keeps every single HTTP request short (well
     under any proxy/browser timeout), no matter how long the whole batch
     takes end to end."""
+    progress_html = ""
+    if total:
+        pct = int(100 * (done or 0) / total)
+        progress_html = f"""
+        <div style="width:100%;max-width:320px;margin:18px auto 0;background:var(--border-soft);border-radius:999px;height:8px;overflow:hidden">
+          <div style="width:{pct}%;height:100%;background:var(--ink);transition:width .3s ease"></div>
+        </div>
+        <p class="muted" style="font-size:12px;margin-top:8px">{done or 0} of {total} done</p>
+        """
     return PAGE_HEAD + f"""
     <meta http-equiv="refresh" content="3;url={poll_url}">
     <div class="fade-in">
     <div class="card" style="text-align:center;padding:64px 28px">
     <span class="spinner-lg"></span>
     <p class="muted" style="margin-top:18px">{message}</p>
-    <p class="muted" style="font-size:12px;margin-top:6px">This page refreshes itself automatically — you can leave it open.</p>
+    {progress_html}
+    <p class="muted" style="font-size:12px;margin-top:14px">This page refreshes itself automatically — you can leave it open.</p>
     </div>
     </div>
     </body></html>
@@ -263,8 +276,23 @@ def _price_row(row):
 
 def _run_preview_job(token, rows):
     try:
+        _PREVIEWS[token] = {"status": "processing", "done": 0, "total": len(rows)}
+        preview_rows = [None] * len(rows)
         with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
-            preview_rows = list(executor.map(_price_row, rows))
+            future_to_idx = {executor.submit(_price_row, row): i for i, row in enumerate(rows)}
+            done_count = 0
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    preview_rows[idx] = future.result()
+                except Exception as e:
+                    preview_rows[idx] = {"row_number": rows[idx]["row_number"],
+                                          "reference": rows[idx]["reference_1"],
+                                          "error": f"Unexpected error: {e}"}
+                done_count += 1
+                # Keep the in-progress entry's status as "processing" so the
+                # poller keeps refreshing, but update the counts live.
+                _PREVIEWS[token] = {"status": "processing", "done": done_count, "total": len(rows)}
         _PREVIEWS[token] = {"status": "done", "preview_rows": preview_rows}
     except Exception as e:
         _PREVIEWS[token] = {"status": "error", "message": str(e)}
@@ -368,11 +396,11 @@ async def preview(auth: bool = Depends(check_auth), file: UploadFile = File(...)
 
     token = uuid.uuid4().hex
     _BATCHES[token] = {"rows": rows}
-    _PREVIEWS[token] = {"status": "processing"}
+    _PREVIEWS[token] = {"status": "processing", "done": 0, "total": len(rows)}
 
     threading.Thread(target=_run_preview_job, args=(token, rows), daemon=True).start()
 
-    return HTMLResponse(waiting_page(f"/preview/{token}", f"Pricing {len(rows)} row(s) against GOFO Ground and the fallback carriers…"))
+    return HTMLResponse(waiting_page(f"/preview/{token}", "Pricing against GOFO Ground and the fallback carriers…", done=0, total=len(rows)))
 
 
 @app.get("/preview/{token}", response_class=HTMLResponse)
@@ -384,8 +412,9 @@ def preview_status(token: str, auth: bool = Depends(check_auth)):
                              status_code=404)
 
     if entry["status"] == "processing":
-        rows = _BATCHES.get(token, {}).get("rows", [])
-        return HTMLResponse(waiting_page(f"/preview/{token}", f"Pricing {len(rows)} row(s) against GOFO Ground and the fallback carriers…"))
+        total = entry.get("total") or len(_BATCHES.get(token, {}).get("rows", []))
+        done = entry.get("done", 0)
+        return HTMLResponse(waiting_page(f"/preview/{token}", "Pricing against GOFO Ground and the fallback carriers…", done=done, total=total))
 
     if entry["status"] == "error":
         return HTMLResponse(PAGE_HEAD + f"<div class='card fade-in'><p class='status-err'>Something went wrong while pricing: {entry.get('message')}</p>"
@@ -465,8 +494,21 @@ def _create_row(row):
 
 def _run_process_job(token, rows):
     try:
+        _RESULTS[token] = {"status": "processing", "done": 0, "total": len(rows)}
+        results = [None] * len(rows)
         with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
-            results = list(executor.map(_create_row, rows))
+            future_to_idx = {executor.submit(_create_row, row): i for i, row in enumerate(rows)}
+            done_count = 0
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    results[idx] = {"row_number": rows[idx]["row_number"], "fixes": rows[idx]["fixes"],
+                                     "reference": rows[idx]["reference_1"], "status": "error",
+                                     "message": f"Unexpected error: {e}"}
+                done_count += 1
+                _RESULTS[token] = {"status": "processing", "done": done_count, "total": len(rows)}
 
         label_urls = [r["label_url"] for r in results if r.get("label_url")]
 
@@ -546,11 +588,11 @@ async def process(auth: bool = Depends(check_auth), token: str = Form(...)):
                              " Please upload the file again.</p><p><a href='/'>&larr; Back</a></p></div></body></html>",
                              status_code=404)
     rows = batch["rows"]
-    _RESULTS[token] = {"status": "processing"}
+    _RESULTS[token] = {"status": "processing", "done": 0, "total": len(rows)}
 
     threading.Thread(target=_run_process_job, args=(token, rows), daemon=True).start()
 
-    return HTMLResponse(waiting_page(f"/results/{token}", f"Creating {len(rows)} label(s)…"))
+    return HTMLResponse(waiting_page(f"/results/{token}", "Creating labels…", done=0, total=len(rows)))
 
 
 @app.get("/results/{token}", response_class=HTMLResponse)
@@ -562,9 +604,9 @@ def results_status(token: str, auth: bool = Depends(check_auth)):
                              status_code=404)
 
     if entry["status"] == "processing":
-        rows = _BATCHES.get(token, {}).get("rows", [])
-        count = len(rows) if rows else ""
-        return HTMLResponse(waiting_page(f"/results/{token}", f"Creating {count} label(s)…".replace("  ", " ")))
+        total = entry.get("total") or len(_BATCHES.get(token, {}).get("rows", []))
+        done = entry.get("done", 0)
+        return HTMLResponse(waiting_page(f"/results/{token}", "Creating labels…", done=done, total=total))
 
     if entry["status"] == "error":
         return HTMLResponse(PAGE_HEAD + f"<div class='card fade-in'><p class='status-err'>Something went wrong while creating labels: {entry.get('message')}</p>"
