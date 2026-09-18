@@ -18,7 +18,12 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "changeme")
 APP_USERNAME = os.environ.get("APP_USERNAME", "vikaas")
 
 GOFO_OVERRIDE_PARCEL = {"weight": 4.0, "length": 6.0, "width": 4.0, "height": 4.0}
-FALLBACK_SERVICES = ["usps_ground_advantage", "ups_ground_saver", "fedex_home_delivery"]
+USPS_GROUND_SERVICE = "usps_ground_advantage"
+# NOTE: the real service tag Gori returns for FedEx's cheap ground tier is
+# "fedex_ground" - "fedex_home_delivery" (used here previously) never
+# actually matches anything in a get_rates response, so FedEx was silently
+# never picked as a fallback carrier. Fixed.
+FALLBACK_SERVICES = ["usps_ground_advantage", "ups_ground_saver", "fedex_ground"]
 
 app = FastAPI(title="Gori Label Batch Uploader")
 security = HTTPBasic()
@@ -202,11 +207,16 @@ def index(auth: bool = Depends(check_auth)):
 # ---------------------------------------------------------------------------
 # Rate / carrier selection
 # ---------------------------------------------------------------------------
-def cheapest_rate(rates):
-    candidates = [r for r in rates if "fees" in r]
-    if not candidates:
-        return None
-    return min(candidates, key=lambda r: r["fees"]["amount"])
+def find_service(rates, service_name):
+    """Picks out one specific service tag from a get_rates response (which
+    always returns every service every carrier offers - USPS alone has ~10
+    tiers). Used instead of "cheapest of everything", which was accidentally
+    matching odd tiers like usps_bound_printed_matter or usps_media instead
+    of the ground service actually meant for these shipments."""
+    for r in rates:
+        if r.get("service") == service_name and "fees" in r:
+            return r
+    return None
 
 
 def pick_fallback(to_addr, from_addr, sheet_parcel, notes):
@@ -241,35 +251,64 @@ def pick_service_and_parcel(to_addr, from_addr, sheet_parcel):
 
 
 def _price_row(row):
+    """Prices one row for the preview screen.
+
+    Two batches are compared, apples-to-apples, same box size on both sides:
+      - "Optimized" (what we'll actually book): GOFO Ground at its forced
+        4oz/6x4x4 box when GOFO covers the address; otherwise USPS Ground
+        Advantage at the sheet's real weight/dims (GOFO's unavailable, so
+        that USPS quote is what actually gets booked - it's final).
+      - "Baseline" (what the same box would cost without the GOFO discount):
+        USPS Ground Advantage, priced at the SAME box GOFO would have used
+        when GOFO is available (not the original, often bigger/heavier box -
+        comparing GOFO's small box against a real full-size box inflated the
+        "savings" number). When GOFO isn't available, baseline is just the
+        same USPS figure as the optimized price - no savings to claim there,
+        since that's the number we're actually paying either way.
+
+    A single get_rates call already returns every carrier's every service
+    tier, so both the GOFO figure and the same-box USPS figure come out of
+    ONE call (at GOFO_OVERRIDE_PARCEL), and the real-dims USPS figure comes
+    out of the other call we already make (at the sheet's own dims) - no
+    extra API calls needed for any of this.
+    """
     if row["error"]:
         return {"row_number": row["row_number"], "reference": row["reference_1"],
                  "error": row["error"]}
 
     try:
         orig_rates = gori_client.get_rates(row["to_address"], row["from_address"], row["sheet_parcel_oz_in"])
-        orig_best = cheapest_rate(orig_rates)
+        usps_real = find_service(orig_rates, USPS_GROUND_SERVICE)
     except Exception:
-        orig_best = None
+        usps_real = None
 
     try:
         gofo_rates = gori_client.get_rates(row["to_address"], row["from_address"], GOFO_OVERRIDE_PARCEL)
         gofo_best = next((r for r in gofo_rates if r.get("carrier") == "gofo" and r.get("service") == "gofo_ground" and "fees" in r), None)
+        usps_reduced = find_service(gofo_rates, USPS_GROUND_SERVICE)
     except Exception:
         gofo_best = None
+        usps_reduced = None
 
     # GOFO's own service area excludes most rural/remote ZIPs, so a valid
     # address that GOFO can't quote is a reliable proxy for "rural/hard to reach".
-    is_rural = bool(orig_best) and not gofo_best
+    is_rural = bool(usps_real or usps_reduced) and not gofo_best
 
-    orig_amount = orig_best["fees"]["amount"] if orig_best else None
-    gofo_amount = gofo_best["fees"]["amount"] if gofo_best else None
+    if gofo_best:
+        optimized_service = "gofo_ground"
+        optimized_amount = gofo_best["fees"]["amount"]
+        baseline_amount = usps_reduced["fees"]["amount"] if usps_reduced else None
+    else:
+        optimized_service = USPS_GROUND_SERVICE
+        optimized_amount = usps_real["fees"]["amount"] if usps_real else None
+        baseline_amount = optimized_amount
 
     return {
         "row_number": row["row_number"],
         "reference": row["reference_1"],
-        "orig_service": orig_best.get("service") if orig_best else None,
-        "orig_amount": orig_amount,
-        "gofo_amount": gofo_amount,
+        "optimized_service": optimized_service if optimized_amount is not None else None,
+        "optimized_amount": optimized_amount,
+        "baseline_amount": baseline_amount,
         "is_rural": is_rural,
         "error": None,
     }
@@ -300,25 +339,23 @@ def _run_preview_job(token, rows):
 
 
 def render_preview_page(token, preview_rows):
-    total_original = 0.0
-    total_gofo = 0.0
+    total_baseline = 0.0
+    total_optimized = 0.0
     priced_count = 0
     rural_count = 0
     for pr in preview_rows:
         if pr.get("is_rural"):
             rural_count += 1
-        orig_amount = pr.get("orig_amount")
-        gofo_amount = pr.get("gofo_amount")
-        if orig_amount is not None:
-            total_original += orig_amount
-        if gofo_amount is not None:
-            total_gofo += gofo_amount
-        elif orig_amount is not None:
-            total_gofo += orig_amount  # GOFO unavailable, this row will fall back to the same price
-        if orig_amount is not None or gofo_amount is not None:
+        baseline_amount = pr.get("baseline_amount")
+        optimized_amount = pr.get("optimized_amount")
+        if baseline_amount is not None:
+            total_baseline += baseline_amount
+        if optimized_amount is not None:
+            total_optimized += optimized_amount
+        if baseline_amount is not None or optimized_amount is not None:
             priced_count += 1
 
-    savings = total_original - total_gofo
+    savings = total_baseline - total_optimized
 
     rows_html = []
     for pr in preview_rows:
@@ -328,14 +365,17 @@ def render_preview_page(token, preview_rows):
                 f"<td class='status-err' colspan='4'>{pr['error']}</td></tr>"
             )
             continue
-        orig_txt = f"${pr['orig_amount']:.2f} ({pr.get('orig_service') or '?'})" if pr['orig_amount'] is not None else "—"
-        gofo_txt = f"${pr['gofo_amount']:.2f}" if pr['gofo_amount'] is not None else "unavailable, uses fallback"
-        row_savings = (pr['orig_amount'] - pr['gofo_amount']) if (pr['orig_amount'] is not None and pr['gofo_amount'] is not None) else None
+        baseline_amount = pr.get("baseline_amount")
+        optimized_amount = pr.get("optimized_amount")
+        optimized_service = pr.get("optimized_service")
+        baseline_txt = f"${baseline_amount:.2f} (USPS Ground Advantage)" if baseline_amount is not None else "—"
+        optimized_txt = f"${optimized_amount:.2f} ({optimized_service})" if optimized_amount is not None else "unavailable"
+        row_savings = (baseline_amount - optimized_amount) if (baseline_amount is not None and optimized_amount is not None) else None
         savings_txt = f"${row_savings:.2f}" if row_savings is not None else "—"
         rural_txt = "<span class='badge other'>Rural / remote</span>" if pr.get("is_rural") else ""
         rows_html.append(
             f"<tr><td>{pr['row_number']}</td><td>{pr.get('reference','')}</td>"
-            f"<td>{orig_txt}</td><td>{gofo_txt}</td><td>{savings_txt}</td><td>{rural_txt}</td></tr>"
+            f"<td>{baseline_txt}</td><td>{optimized_txt}</td><td>{savings_txt}</td><td>{rural_txt}</td></tr>"
         )
 
     rural_note = (
@@ -347,12 +387,12 @@ def render_preview_page(token, preview_rows):
     return PAGE_HEAD + f"""
     <div class="fade-in">
     <div class="top-nav"><h1>Rate Preview</h1><a href="/">&larr; Upload a different file</a></div>
-    <p class="subtitle">Estimated cost across {priced_count} priceable rows, before any label is purchased.</p>
+    <p class="subtitle">Estimated cost across {priced_count} priceable rows, before any label is purchased. Both columns price the same box size, so the savings figure is apples-to-apples.</p>
 
     <div class="card">
     <div class="row-grid">
-      <div class="stat"><div class="label">At original weight/dims</div><div class="value">${total_original:.2f}</div></div>
-      <div class="stat"><div class="label">Via GOFO Ground (4oz, 6x4x4)</div><div class="value">${total_gofo:.2f}</div></div>
+      <div class="stat"><div class="label">USPS Ground Advantage (same box)</div><div class="value">${total_baseline:.2f}</div></div>
+      <div class="stat"><div class="label">GOFO first, USPS fallback (optimized)</div><div class="value">${total_optimized:.2f}</div></div>
       <div class="stat highlight"><div class="label">Estimated savings</div><div class="value">${savings:.2f}</div></div>
       <div class="stat"><div class="label">Rural / remote ZIPs</div><div class="value">{rural_count}</div></div>
     </div>
@@ -367,7 +407,7 @@ def render_preview_page(token, preview_rows):
     <div class="card">
     <h2>Row-by-row</h2>
     <table>
-    <tr><th>Row</th><th>Ref</th><th>Original (cheapest carrier)</th><th>GOFO Ground</th><th>Savings</th><th>Zone</th></tr>
+    <tr><th>Row</th><th>Ref</th><th>USPS Ground Advantage (same box)</th><th>Optimized</th><th>Savings</th><th>Zone</th></tr>
     {''.join(rows_html)}
     </table>
     </div>
