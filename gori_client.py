@@ -4,7 +4,7 @@ import threading
 import requests
 
 GORI_BASE_URL = os.environ.get("GORI_BASE_URL", "https://api.goricompany.com/v2").rstrip("/")
-GORI_AUTH_URL = os.environ.get("GORI_AUTH_URL", "https://api.goricompany.com/auth/token")
+GORI_AUTH_URL = os.environ.get("GORI_AUTH_URL", "https://api.goricompany.com/v2/auth/token")
 GORI_CLIENT_ID = os.environ.get("GORI_CLIENT_ID", "")
 GORI_CLIENT_SECRET = os.environ.get("GORI_CLIENT_SECRET", "")
 

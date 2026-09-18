@@ -215,40 +215,32 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/debug-auth")
-def debug_auth(auth: bool = Depends(check_auth)):
-    """Temporary diagnostic: try a handful of plausible Gori auth endpoints/bases
-    and report which one actually returns a token, so we can pin down the real
-    API surface without guessing blind."""
-    import requests as _requests
+@app.get("/debug-rates")
+def debug_rates(auth: bool = Depends(check_auth)):
+    """Temporary diagnostic: now that /v2/auth/token is confirmed working,
+    try a few plausible paths for the rates and shipments endpoints."""
+    to_address = {
+        "street1": "316 Embrey Mill Rd", "city": "Stafford", "state": "VA",
+        "zip": "22554-2577", "country": "US", "first_name": "Test", "last_name": "Test",
+    }
+    from_address = {
+        "street1": "2550 Southwell Rd", "city": "Dallas", "state": "TX",
+        "zip": "75229", "country": "US", "company": "SHIPPING DEPT",
+    }
+    parcel = {"length": 6, "width": 4, "height": 4, "weight": 4}
+    body = {"to_address": to_address, "from_address": from_address, "parcel": parcel}
     candidates = [
-        ("https://api.goricompany.com/auth/token", "json"),
-        ("https://api.goricompany.com/oauth/token", "json"),
-        ("https://api.goricompany.com/v2/auth/token", "json"),
-        ("https://api.goricompany.com/v1/auth/token", "json"),
-        ("https://api.goricompany.com/api/auth/token", "json"),
-        ("https://api.goricompany.com/auth/token", "form"),
-        ("https://staging.api.goricompany.com/auth/token", "json"),
-        ("https://app.goricompany.com/auth/token", "json"),
-        ("https://api.gori.ai/auth/token", "json"),
-        ("https://api.gori.ai/v2/auth/token", "json"),
+        "https://api.goricompany.com/v2/rates",
+        "https://api.goricompany.com/v2/rate",
+        "https://api.goricompany.com/v2/shipping/rates",
+        "https://api.goricompany.com/v2/shipments/rates",
+        "https://api.goricompany.com/rates",
     ]
     results = []
-    for url, mode in candidates:
+    for url in candidates:
         try:
-            body = {
-                "client_id": gori_client.GORI_CLIENT_ID,
-                "client_secret": gori_client.GORI_CLIENT_SECRET,
-                "grant_type": "client_credentials",
-            }
-            if mode == "json":
-                resp = requests.post(url, json=body, timeout=15)
-            else:
-                resp = requests.post(url, data=body, timeout=15)
-            results.append({
-                "url": url, "mode": mode, "status": resp.status_code,
-                "body": resp.text[:300],
-            })
+            resp = requests.post(url, headers=gori_client._headers(), json=body, timeout=15)
+            results.append({"url": url, "status": resp.status_code, "body": resp.text[:400]})
         except Exception as e:
-            results.append({"url": url, "mode": mode, "error": str(e)})
+            results.append({"url": url, "error": str(e)})
     return results
