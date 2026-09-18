@@ -261,24 +261,34 @@ def debug_rates(auth: bool = Depends(check_auth)):
         except Exception as e:
             return {"decode_error": str(e)}
 
-    scope_variants = [None, "*", "rates shipments tracking refunds", "read write",
-                       "rates", "shipments:read shipments:write rates:read",
-                       "gori.rates gori.shipments", "full_access", "all"]
-    body = body_variants["basic"]
-    for scope in scope_variants:
+    # Get a wildcard-scope token (confirmed to work for token issuance)
+    token_resp = get_token_with_scope("*")
+    token = token_resp.json().get("access_token") if token_resp.status_code == 200 else None
+    results.append({"token_status": token_resp.status_code, "got_token": bool(token)})
+
+    if token:
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        basic_body = body_variants["basic"]
+        wrapped_variants = {
+            "unwrapped": basic_body,
+            "wrapped_shipment": {"shipment": basic_body},
+            "wrapped_rate": {"rate": basic_body},
+            "shipment_recipient_shipper": {"shipment": {
+                "recipient": to_address, "shipper": from_address, "parcel": parcel,
+            }},
+        }
+        for name, b in wrapped_variants.items():
+            try:
+                resp = requests.post(url, headers=headers, json=b, timeout=15)
+                results.append({"variant": name, "status": resp.status_code, "body": resp.text[:400]})
+            except Exception as e:
+                results.append({"variant": name, "error": str(e)})
+
+        # also check what GET /v2/shipments (known-good per docs) returns, to sanity check auth/network at least
         try:
-            token_resp = get_token_with_scope(scope)
-            token_json = token_resp.json() if token_resp.status_code == 200 else {}
-            token = token_json.get("access_token")
-            claims = decode_claims(token) if token else None
-            entry = {"scope_requested": scope, "token_status": token_resp.status_code,
-                      "token_scopes_claim": claims.get("scopes") if isinstance(claims, dict) else claims}
-            if token:
-                rate_resp = requests.post(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=body, timeout=15)
-                entry["rate_status"] = rate_resp.status_code
-                entry["rate_body"] = rate_resp.text[:300]
-            results.append(entry)
+            resp = requests.get("https://api.goricompany.com/v2/shipments?page_size=5&page=1", headers=headers, timeout=15)
+            results.append({"variant": "GET /v2/shipments", "status": resp.status_code, "body": resp.text[:400]})
         except Exception as e:
-            results.append({"scope_requested": scope, "error": str(e)})
+            results.append({"variant": "GET /v2/shipments", "error": str(e)})
 
     return results
