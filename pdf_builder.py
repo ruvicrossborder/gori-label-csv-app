@@ -11,7 +11,7 @@ from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 
 
-def _draw_cover_page(c, results, batch_date, total_cost):
+def _draw_cover_page(c, results, batch_date):
     width, height = letter
     margin = 0.6 * inch
     y = height - margin
@@ -25,17 +25,15 @@ def _draw_cover_page(c, results, batch_date, total_cost):
     y -= 14
     ok_count = sum(1 for r in results if r["status"] == "ok")
     c.drawString(margin, y, f"Labels created: {ok_count} of {len(results)} rows")
-    y -= 14
-    c.drawString(margin, y, f"Total postage cost: ${total_cost:.2f}")
     y -= 24
 
     c.setLineWidth(0.5)
     c.line(margin, y, width - margin, y)
     y -= 18
 
-    # Table header
-    col_x = [margin, margin + 0.4 * inch, margin + 1.6 * inch, margin + 3.5 * inch, margin + 5.0 * inch, margin + 5.8 * inch]
-    headers = ["Row", "Ref", "Carrier / Service", "Tracking #", "Cost", "Status"]
+    # Table header (no pricing on the master/cover page, by design)
+    col_x = [margin, margin + 0.45 * inch, margin + 1.8 * inch, margin + 4.3 * inch, margin + 6.4 * inch]
+    headers = ["Row", "Ref", "Carrier / Service", "Tracking #", "Status"]
     c.setFont("Helvetica-Bold", 9)
     for x, h in zip(col_x, headers):
         c.drawString(x, y, h)
@@ -58,19 +56,17 @@ def _draw_cover_page(c, results, batch_date, total_cost):
             c.setFont("Helvetica", 8.5)
 
         row_num = str(r.get("row_number", ""))
-        ref = str(r.get("reference", "") or "")[:14]
+        ref = str(r.get("reference", "") or "")[:16]
         if r["status"] == "ok":
-            service = str(r.get("service", ""))[:26]
-            tracking = str(r.get("tracking", "") or "")[:24]
-            cost = f"${r.get('cost'):.2f}" if r.get("cost") is not None else ""
+            service = str(r.get("service", ""))[:32]
+            tracking = str(r.get("tracking", "") or "")[:26]
             status = "OK"
         else:
-            service = str(r.get("message", ""))[:26]
+            service = str(r.get("message", ""))[:32]
             tracking = ""
-            cost = ""
             status = "FAILED"
 
-        values = [row_num, ref, service, tracking, cost, status]
+        values = [row_num, ref, service, tracking, status]
         for x, v in zip(col_x, values):
             c.drawString(x, y, v)
         y -= row_h
@@ -83,11 +79,10 @@ def build_batch_pdf(results, label_urls):
     label_urls: ordered list of hosted carrier label PDF URLs (successful rows only).
     Returns (pdf_bytes, filename)."""
     batch_date = datetime.date.today().isoformat()
-    total_cost = sum(r.get("cost") or 0 for r in results if r["status"] == "ok")
 
     cover_buf = io.BytesIO()
     c = canvas.Canvas(cover_buf, pagesize=letter)
-    _draw_cover_page(c, results, batch_date, total_cost)
+    _draw_cover_page(c, results, batch_date)
     c.save()
     cover_buf.seek(0)
 
