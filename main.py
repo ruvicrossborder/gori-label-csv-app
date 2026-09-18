@@ -248,3 +248,31 @@ def download_pdf(auth: bool = Depends(check_auth)):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/debug-find-shipment")
+def debug_find_shipment(ref: str, auth: bool = Depends(check_auth)):
+    """Temporary: look up a shipment by reference_1 via a direct GET (read-only,
+    known to work) so a stray test shipment can be found and refunded."""
+    import os as _os
+    client_id = _os.environ.get("GORI_CLIENT_ID", "")
+    client_secret = _os.environ.get("GORI_CLIENT_SECRET", "")
+    auth_url = _os.environ.get("GORI_AUTH_URL", "https://api.goricompany.com/v2/auth/token")
+    base_url = _os.environ.get("GORI_BASE_URL", "https://api.goricompany.com/v2").rstrip("/")
+    token_resp = requests.post(auth_url, json={
+        "client_id": client_id, "client_secret": client_secret,
+        "grant_type": "client_credentials", "scope": "*",
+    }, timeout=15)
+    token = token_resp.json().get("access_token")
+    matches = []
+    for page in range(1, 4):
+        resp = requests.get(f"{base_url}/shipments", params={"page_size": 50, "page": page},
+                             headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        data = resp.json()
+        shipments = data.get("shipments", [])
+        if not shipments:
+            break
+        for s in shipments:
+            if s.get("reference_1") == ref:
+                matches.append(s)
+    return {"matches": matches}
