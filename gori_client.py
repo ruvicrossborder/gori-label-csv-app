@@ -1,78 +1,106 @@
 import os
-import time
-import threading
+import json
 import requests
 
-GORI_BASE_URL = os.environ.get("GORI_BASE_URL", "https://api.goricompany.com/v2").rstrip("/")
-GORI_AUTH_URL = os.environ.get("GORI_AUTH_URL", "https://api.goricompany.com/v2/auth/token")
-GORI_CLIENT_ID = os.environ.get("GORI_CLIENT_ID", "")
-GORI_CLIENT_SECRET = os.environ.get("GORI_CLIENT_SECRET", "")
-
-_lock = threading.Lock()
-_token_cache = {"token": None, "expires_at": 0}
-
-
-def _get_token():
-    with _lock:
-        if _token_cache["token"] and time.time() < _token_cache["expires_at"] - 60:
-            return _token_cache["token"]
-        resp = requests.post(
-            GORI_AUTH_URL,
-            json={
-                "client_id": GORI_CLIENT_ID,
-                "client_secret": GORI_CLIENT_SECRET,
-                "grant_type": "client_credentials",
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        token = data.get("access_token") or data.get("token")
-        expires_in = data.get("expires_in", 12 * 3600)
-        _token_cache["token"] = token
-        _token_cache["expires_at"] = time.time() + int(expires_in)
-        return token
+# This client talks to the gori-mcp server (a working, already-proven wrapper
+# around the real Gori API) via its MCP JSON-RPC endpoint, rather than calling
+# api.goricompany.com directly. Direct calls to api.goricompany.com consistently
+# returned 500 errors regardless of request shape; the gori-mcp server's own
+# get_rates/create_shipment tools reliably succeed for the exact same inputs,
+# so we reuse that proven path instead of re-guessing the raw API's schema.
+GORI_MCP_URL = os.environ.get("GORI_MCP_URL", "https://gori-mcp-production.up.railway.app/mcp")
 
 
-def _headers():
-    return {
-        "Authorization": f"Bearer {_get_token()}",
-        "Content-Type": "application/json",
+def _call_tool(name, arguments):
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
     }
+    resp = requests.post(
+        GORI_MCP_URL,
+        json=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+
+    content_type = resp.headers.get("content-type", "")
+    if "text/event-stream" in content_type:
+        data_line = None
+        for line in resp.text.splitlines():
+            if line.startswith("data:"):
+                data_line = line[len("data:"):].strip()
+                break
+        if not data_line:
+            raise RuntimeError(f"No data line in SSE response: {resp.text[:500]}")
+        rpc_result = json.loads(data_line)
+    else:
+        rpc_result = resp.json()
+
+    if "error" in rpc_result:
+        raise RuntimeError(f"gori-mcp error: {rpc_result['error']}")
+
+    result = rpc_result.get("result", {})
+    content = result.get("content", [])
+    if not content:
+        raise RuntimeError(f"gori-mcp returned no content: {rpc_result}")
+
+    text = content[0].get("text", "")
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        raise RuntimeError(f"gori-mcp tool call failed: {text}")
+
+    if isinstance(parsed, dict) and parsed.get("error"):
+        raise RuntimeError(f"gori-mcp tool error: {parsed['error']}")
+
+    return parsed
 
 
-def _request(method, path, json_body=None, params=None):
-    url = f"{GORI_BASE_URL}{path}"
-    resp = requests.request(method, url, headers=_headers(), json=json_body, params=params, timeout=60)
-    if resp.status_code == 401:
-        # token may have been invalidated server-side; force refresh once
-        with _lock:
-            _token_cache["token"] = None
-        resp = requests.request(method, url, headers=_headers(), json=json_body, params=params, timeout=60)
-    return resp
+def _split_name(full_name):
+    full_name = (full_name or "").strip()
+    if not full_name:
+        return "", ""
+    parts = full_name.split(" ", 1)
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], parts[1]
+
+
+def _to_mcp_address(addr):
+    """Accepts either {first_name, last_name, ...} or {name, ...} and returns
+    the gori-mcp address schema (first_name/last_name)."""
+    addr = dict(addr or {})
+    if "first_name" not in addr and "name" in addr:
+        first, last = _split_name(addr.pop("name"))
+        addr["first_name"] = first
+        addr["last_name"] = last
+    return addr
 
 
 def get_rates(to_address, from_address, parcel):
-    resp = _request("POST", "/shipments/rates", json_body={
-        "to_address": to_address,
-        "from_address": from_address,
+    args = {
+        "to_address": _to_mcp_address(to_address),
+        "from_address": _to_mcp_address(from_address),
         "parcel": parcel,
-    })
-    resp.raise_for_status()
-    return resp.json()
+    }
+    return _call_tool("get_rates", args)
 
 
 def create_shipment(service, to_address, from_address, parcel, reference_1=None, reference_2=None):
-    body = {
+    args = {
         "service": service,
-        "to_address": to_address,
-        "from_address": from_address,
+        "to_address": _to_mcp_address(to_address),
+        "from_address": _to_mcp_address(from_address),
         "parcel": parcel,
     }
     if reference_1:
-        body["reference_1"] = reference_1
+        args["reference_1"] = reference_1
     if reference_2:
-        body["reference_2"] = reference_2
-    resp = _request("POST", "/shipments", json_body=body)
-    resp.raise_for_status()
-    return resp.json()
+        args["reference_2"] = reference_2
+    return _call_tool("create_shipment", args)
