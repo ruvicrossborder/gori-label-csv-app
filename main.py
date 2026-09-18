@@ -218,20 +218,45 @@ def health():
 @app.get("/debug-rates")
 def debug_rates(auth: bool = Depends(check_auth)):
     """Temporary diagnostic: confirm the fixed /shipments/rates path works."""
-    to_address = {
-        "street1": "316 Embrey Mill Rd", "city": "Stafford", "state": "VA",
-        "zip": "22554-2577", "country": "US", "first_name": "Test", "last_name": "Test",
-    }
-    from_address = {
-        "street1": "2550 Southwell Rd", "city": "Dallas", "state": "TX",
-        "zip": "75229", "country": "US", "company": "SHIPPING DEPT",
-    }
+    import datetime
+    today = datetime.date.today().isoformat()
     parcel = {"length": 6, "width": 4, "height": 4, "weight": 4}
     results = []
-    try:
-        rates = gori_client.get_rates(to_address, from_address, parcel)
-        results.append({"variant": "gori_client.get_rates (/shipments/rates)", "ok": True, "rates": rates})
-    except Exception as e:
-        body = getattr(getattr(e, "response", None), "text", None)
-        results.append({"variant": "gori_client.get_rates (/shipments/rates)", "ok": False, "error": str(e), "body": body})
+
+    variants = {
+        "first_last_no_ship_date": (
+            {"street1": "316 Embrey Mill Rd", "city": "Stafford", "state": "VA", "zip": "22554-2577", "country": "US", "first_name": "Test", "last_name": "Test"},
+            {"street1": "2550 Southwell Rd", "city": "Dallas", "state": "TX", "zip": "75229", "country": "US", "company": "SHIPPING DEPT"},
+            {},
+        ),
+        "name_field_no_ship_date": (
+            {"street1": "316 Embrey Mill Rd", "city": "Stafford", "state": "VA", "zip": "22554-2577", "country": "US", "name": "Test Test"},
+            {"street1": "2550 Southwell Rd", "city": "Dallas", "state": "TX", "zip": "75229", "country": "US", "name": "SHIPPING DEPT"},
+            {},
+        ),
+        "name_field_with_ship_date": (
+            {"street1": "316 Embrey Mill Rd", "city": "Stafford", "state": "VA", "zip": "22554-2577", "country": "US", "name": "Test Test"},
+            {"street1": "2550 Southwell Rd", "city": "Dallas", "state": "TX", "zip": "75229", "country": "US", "name": "SHIPPING DEPT"},
+            {"ship_date": today},
+        ),
+        "first_last_with_ship_date": (
+            {"street1": "316 Embrey Mill Rd", "city": "Stafford", "state": "VA", "zip": "22554-2577", "country": "US", "first_name": "Test", "last_name": "Test"},
+            {"street1": "2550 Southwell Rd", "city": "Dallas", "state": "TX", "zip": "75229", "country": "US", "company": "SHIPPING DEPT"},
+            {"ship_date": today},
+        ),
+    }
+
+    for name, (to_addr, from_addr, extra) in variants.items():
+        try:
+            body = {"to_address": to_addr, "from_address": from_addr, "parcel": parcel, **extra}
+            resp = requests.post(
+                f"{gori_client.GORI_BASE_URL}/shipments/rates",
+                headers=gori_client._headers(),
+                json=body,
+                timeout=30,
+            )
+            results.append({"variant": name, "status": resp.status_code, "body": resp.text[:800]})
+        except Exception as e:
+            results.append({"variant": name, "error": str(e)})
+
     return results
