@@ -253,55 +253,68 @@ def pick_service_and_parcel(to_addr, from_addr, sheet_parcel):
 def _price_row(row):
     """Prices one row for the preview screen.
 
-    Two batches are compared, apples-to-apples, same box size on both sides:
-      - "Optimized" (what we'll actually book): GOFO Ground at its forced
-        4oz/6x4x4 box when GOFO covers the address; otherwise USPS Ground
-        Advantage at the sheet's real weight/dims (GOFO's unavailable, so
-        that USPS quote is what actually gets booked - it's final).
-      - "Baseline" (what the same box would cost without the GOFO discount):
-        USPS Ground Advantage, priced at the SAME box GOFO would have used
-        when GOFO is available (not the original, often bigger/heavier box -
-        comparing GOFO's small box against a real full-size box inflated the
-        "savings" number). When GOFO isn't available, baseline is just the
-        same USPS figure as the optimized price - no savings to claim there,
-        since that's the number we're actually paying either way.
+    Order of operations (matches how GOFO coverage is actually determined -
+    by ZIP/address, not by box size):
+      1. Run the package through GOFO at its REAL sheet weight/dims first.
+         This is purely a coverage check: does GOFO serve this address at
+         all? The same call also gets us the USPS Ground Advantage price at
+         the real size for free, so it's used either way.
+      2. If GOFO does NOT show up in that response, GOFO doesn't serve this
+         ZIP - full stop. The real-dims USPS Ground Advantage price is final
+         for this row, and it's used for both "optimized" and "baseline"
+         (no synthetic savings to claim on a row GOFO was never going to
+         touch).
+      3. If GOFO DOES show up, only THEN do we ask what it would cost at the
+         reduced 4oz/6x4x4 box - and, in that same call, what USPS Ground
+         Advantage would cost at that same reduced box, for an apples-to-
+         apples "what would this same small box cost without GOFO" baseline.
 
-    A single get_rates call already returns every carrier's every service
-    tier, so both the GOFO figure and the same-box USPS figure come out of
-    ONE call (at GOFO_OVERRIDE_PARCEL), and the real-dims USPS figure comes
-    out of the other call we already make (at the sheet's own dims) - no
-    extra API calls needed for any of this.
+    This means a GOFO-unavailable row costs one API call instead of two, and
+    "unavailable" always reflects real-world coverage rather than an
+    artifact of shrinking the box before checking.
     """
     if row["error"]:
         return {"row_number": row["row_number"], "reference": row["reference_1"],
                  "error": row["error"]}
 
     try:
-        orig_rates = gori_client.get_rates(row["to_address"], row["from_address"], row["sheet_parcel_oz_in"])
-        usps_real = find_service(orig_rates, USPS_GROUND_SERVICE)
+        rates_real = gori_client.get_rates(row["to_address"], row["from_address"], row["sheet_parcel_oz_in"])
     except Exception:
-        usps_real = None
+        rates_real = []
 
-    try:
-        gofo_rates = gori_client.get_rates(row["to_address"], row["from_address"], GOFO_OVERRIDE_PARCEL)
-        gofo_best = next((r for r in gofo_rates if r.get("carrier") == "gofo" and r.get("service") == "gofo_ground" and "fees" in r), None)
-        usps_reduced = find_service(gofo_rates, USPS_GROUND_SERVICE)
-    except Exception:
-        gofo_best = None
-        usps_reduced = None
+    gofo_at_real = next((r for r in rates_real if r.get("carrier") == "gofo" and r.get("service") == "gofo_ground" and "fees" in r), None)
+    usps_real = find_service(rates_real, USPS_GROUND_SERVICE)
 
-    # GOFO's own service area excludes most rural/remote ZIPs, so a valid
-    # address that GOFO can't quote is a reliable proxy for "rural/hard to reach".
-    is_rural = bool(usps_real or usps_reduced) and not gofo_best
-
-    if gofo_best:
-        optimized_service = "gofo_ground"
-        optimized_amount = gofo_best["fees"]["amount"]
-        baseline_amount = usps_reduced["fees"]["amount"] if usps_reduced else None
-    else:
+    if not gofo_at_real:
+        # GOFO doesn't serve this address at all - real-dims USPS is final,
+        # for both columns. This is also the rural/remote-ZIP signal.
+        is_rural = bool(usps_real)
         optimized_service = USPS_GROUND_SERVICE
         optimized_amount = usps_real["fees"]["amount"] if usps_real else None
         baseline_amount = optimized_amount
+    else:
+        # GOFO covers this address - now see what the shrunk box costs,
+        # for GOFO itself and for USPS at that same shrunk box.
+        try:
+            rates_reduced = gori_client.get_rates(row["to_address"], row["from_address"], GOFO_OVERRIDE_PARCEL)
+            gofo_best = next((r for r in rates_reduced if r.get("carrier") == "gofo" and r.get("service") == "gofo_ground" and "fees" in r), None)
+            usps_reduced = find_service(rates_reduced, USPS_GROUND_SERVICE)
+        except Exception:
+            gofo_best = None
+            usps_reduced = None
+
+        is_rural = False
+        if gofo_best:
+            optimized_service = "gofo_ground"
+            optimized_amount = gofo_best["fees"]["amount"]
+            baseline_amount = usps_reduced["fees"]["amount"] if usps_reduced else None
+        else:
+            # Edge case: GOFO covered the address at real size but the
+            # reduced-box call itself failed - fall back to the real-dims
+            # USPS price we already have, same as the no-coverage case.
+            optimized_service = USPS_GROUND_SERVICE
+            optimized_amount = usps_real["fees"]["amount"] if usps_real else None
+            baseline_amount = optimized_amount
 
     return {
         "row_number": row["row_number"],
