@@ -16,7 +16,7 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "changeme")
 APP_USERNAME = os.environ.get("APP_USERNAME", "vikaas")
 
 GOFO_OVERRIDE_PARCEL = {"weight": 4.0, "length": 6.0, "width": 4.0, "height": 4.0}
-FALLBACK_SERVICES = ["usps_ground_advantage", "ups_ground_saver", "fedex_home_delivery"]
+FALLBACK_SERVICES = ["ground_advantage", "ground_saver", "ground"]
 
 app = FastAPI(title="Gori Label Batch Uploader")
 security = HTTPBasic()
@@ -217,8 +217,7 @@ def health():
 
 @app.get("/debug-rates")
 def debug_rates(auth: bool = Depends(check_auth)):
-    """Temporary diagnostic: now that /v2/auth/token is confirmed working,
-    try a few plausible paths for the rates and shipments endpoints."""
+    """Temporary diagnostic: confirm the fixed /shipments/rates path works."""
     to_address = {
         "street1": "316 Embrey Mill Rd", "city": "Stafford", "state": "VA",
         "zip": "22554-2577", "country": "US", "first_name": "Test", "last_name": "Test",
@@ -228,97 +227,11 @@ def debug_rates(auth: bool = Depends(check_auth)):
         "zip": "75229", "country": "US", "company": "SHIPPING DEPT",
     }
     parcel = {"length": 6, "width": 4, "height": 4, "weight": 4}
-    import datetime
-    today = datetime.date.today().isoformat()
-    body_variants = {
-        "basic": {"to_address": to_address, "from_address": from_address, "parcel": parcel},
-        "with_ship_date": {"to_address": to_address, "from_address": from_address, "parcel": parcel, "ship_date": today},
-        "flat": {**to_address, "from_address": from_address, **parcel},
-    }
-    url = "https://api.goricompany.com/v2/rates"
     results = []
-
-    # The default token comes back with "scopes": [] which explains the 500s -
-    # try requesting a token with an explicit scope and see if that changes anything.
-    def get_token_with_scope(scope_value):
-        body = {
-            "client_id": gori_client.GORI_CLIENT_ID,
-            "client_secret": gori_client.GORI_CLIENT_SECRET,
-            "grant_type": "client_credentials",
-        }
-        if scope_value is not None:
-            body["scope"] = scope_value
-        resp = requests.post(gori_client.GORI_AUTH_URL, json=body, timeout=15)
-        return resp
-
-    import base64 as _b64, json as _json2
-
-    def decode_claims(token):
-        try:
-            seg = token.split(".")[1]
-            seg += "=" * (-len(seg) % 4)
-            return _json2.loads(_b64.urlsafe_b64decode(seg))
-        except Exception as e:
-            return {"decode_error": str(e)}
-
-    # Get a wildcard-scope token (confirmed to work for token issuance)
-    token_resp = get_token_with_scope("*")
-    token = token_resp.json().get("access_token") if token_resp.status_code == 200 else None
-    results.append({"token_status": token_resp.status_code, "got_token": bool(token)})
-
-    if token:
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        basic_body = body_variants["basic"]
-        wrapped_variants = {
-            "unwrapped": basic_body,
-            "wrapped_shipment": {"shipment": basic_body},
-            "wrapped_rate": {"rate": basic_body},
-            "shipment_recipient_shipper": {"shipment": {
-                "recipient": to_address, "shipper": from_address, "parcel": parcel,
-            }},
-        }
-        for name, b in wrapped_variants.items():
-            try:
-                resp = requests.post(url, headers=headers, json=b, timeout=15)
-                results.append({"variant": name, "status": resp.status_code, "body": resp.text[:400]})
-            except Exception as e:
-                results.append({"variant": name, "error": str(e)})
-
-        # Pull one full shipment record (untruncated) to see the real field schema
-        try:
-            resp = requests.get("https://api.goricompany.com/v2/shipments?page_size=1&page=1", headers=headers, timeout=15)
-            data = resp.json()
-            shipments = data.get("shipments", [])
-            results.append({"variant": "GET /v2/shipments FULL", "status": resp.status_code,
-                             "one_shipment": shipments[0] if shipments else data})
-        except Exception as e:
-            results.append({"variant": "GET /v2/shipments FULL", "error": str(e)})
-
-        # Real schema uses "name" (not first/last). Try POST /v2/shipments itself
-        # without a "service" - maybe that's how you get a rate quote (shipment-as-quote pattern).
-        to_named = {"name": "Test Test", "street1": to_address["street1"], "city": to_address["city"],
-                    "state": to_address["state"], "zip": to_address["zip"], "country": to_address["country"]}
-        from_named = {"name": "SHIPPING DEPT", "street1": from_address["street1"], "city": from_address["city"],
-                      "state": from_address["state"], "zip": from_address["zip"], "country": from_address["country"]}
-
-        shipments_url = "https://api.goricompany.com/v2/shipments"
-        post_variants = {
-            "rates_no_service_ship_date": {"to_address": to_named, "from_address": from_named, "parcel": parcel, "ship_date": today},
-            "rates_carrier_all_ship_date": {"to_address": to_named, "from_address": from_named, "parcel": parcel, "carrier": "all", "ship_date": today},
-        }
-        for name, b in post_variants.items():
-            try:
-                resp = requests.post(shipments_url, headers=headers, json=b, timeout=15)
-                results.append({"variant": f"POST_shipments_{name}", "status": resp.status_code, "body": resp.text[:500]})
-            except Exception as e:
-                results.append({"variant": f"POST_shipments_{name}", "error": str(e)})
-
-        # also retry /v2/rates with ship_date now
-        try:
-            rate_body = {"to_address": to_named, "from_address": from_named, "parcel": parcel, "ship_date": today}
-            resp = requests.post(url, headers=headers, json=rate_body, timeout=15)
-            results.append({"variant": "rates_with_name_and_ship_date", "status": resp.status_code, "body": resp.text[:600]})
-        except Exception as e:
-            results.append({"variant": "rates_with_name_and_ship_date", "error": str(e)})
-
+    try:
+        rates = gori_client.get_rates(to_address, from_address, parcel)
+        results.append({"variant": "gori_client.get_rates (/shipments/rates)", "ok": True, "rates": rates})
+    except Exception as e:
+        body = getattr(getattr(e, "response", None), "text", None)
+        results.append({"variant": "gori_client.get_rates (/shipments/rates)", "ok": False, "error": str(e), "body": body})
     return results
