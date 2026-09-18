@@ -228,19 +228,25 @@ def debug_rates(auth: bool = Depends(check_auth)):
         "zip": "75229", "country": "US", "company": "SHIPPING DEPT",
     }
     parcel = {"length": 6, "width": 4, "height": 4, "weight": 4}
-    body = {"to_address": to_address, "from_address": from_address, "parcel": parcel}
-    candidates = [
-        "https://api.goricompany.com/v2/rates",
-        "https://api.goricompany.com/v2/rate",
-        "https://api.goricompany.com/v2/shipping/rates",
-        "https://api.goricompany.com/v2/shipments/rates",
-        "https://api.goricompany.com/rates",
-    ]
+    import datetime
+    today = datetime.date.today().isoformat()
+    body_variants = {
+        "basic": {"to_address": to_address, "from_address": from_address, "parcel": parcel},
+        "with_ship_date": {"to_address": to_address, "from_address": from_address, "parcel": parcel, "ship_date": today},
+        "flat": {**to_address, "from_address": from_address, **parcel},
+    }
+    url = "https://api.goricompany.com/v2/rates"
     results = []
-    for url in candidates:
+    for name, body in body_variants.items():
         try:
             resp = requests.post(url, headers=gori_client._headers(), json=body, timeout=15)
-            results.append({"url": url, "status": resp.status_code, "body": resp.text[:400]})
+            results.append({"variant": name, "status": resp.status_code, "body": resp.text[:500]})
         except Exception as e:
-            results.append({"url": url, "error": str(e)})
+            results.append({"variant": name, "error": str(e)})
+    # also try GET with querystring, in case rates is a GET endpoint
+    try:
+        resp = requests.get(url, headers=gori_client._headers(), timeout=15)
+        results.append({"variant": "GET no body", "status": resp.status_code, "body": resp.text[:400]})
+    except Exception as e:
+        results.append({"variant": "GET no body", "error": str(e)})
     return results
