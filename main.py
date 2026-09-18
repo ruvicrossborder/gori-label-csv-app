@@ -37,11 +37,12 @@ _RESULTS = {}   # token -> {"status": "processing"|"done"|"error", ...}
 
 # Rows are independent of each other, so rate lookups / label creation for a
 # whole batch are fanned out across a small thread pool instead of running
-# one row at a time - a 60+ row batch was otherwise taking minutes. Kept
-# modest (rather than higher) because gori-mcp itself appears to queue up or
-# stall when hit with too many concurrent requests - a wide pool made things
-# slower, not faster, once a handful of calls started timing out.
-_MAX_WORKERS = 6
+# one row at a time. Measured directly against gori-mcp: a single get_rates
+# call takes ~15-20s no matter what, and 4 of them fired at once still took
+# ~55s total - i.e. gori-mcp/the carrier APIs behind it barely parallelize,
+# so a wide pool doesn't buy real speed and just adds contention. This is
+# kept small and mostly exists to get a little overlap, not to 10x things.
+_MAX_WORKERS = 3
 
 
 def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
