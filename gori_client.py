@@ -25,7 +25,7 @@ def _call_tool(name, arguments):
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
         },
-        timeout=20,
+        timeout=45,
     )
     resp.raise_for_status()
 
