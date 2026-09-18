@@ -237,16 +237,47 @@ def debug_rates(auth: bool = Depends(check_auth)):
     }
     url = "https://api.goricompany.com/v2/rates"
     results = []
-    for name, body in body_variants.items():
+    base_headers = gori_client._headers()
+
+    # decode the JWT payload (no verification) so we can see what claims/account info it carries
+    try:
+        import base64 as _b64, json as _json2
+        token = base_headers["Authorization"].split(" ", 1)[1]
+        seg = token.split(".")[1]
+        seg += "=" * (-len(seg) % 4)
+        claims = _json2.loads(_b64.urlsafe_b64decode(seg))
+        results.append({"jwt_claims": claims})
+    except Exception as e:
+        results.append({"jwt_claims_error": str(e)})
+
+    header_variants = {
+        "default": base_headers,
+        "with_ua_accept": {**base_headers, "User-Agent": "Mozilla/5.0 (compatible; GoriClient/1.0)", "Accept": "application/json"},
+        "with_ua_accept_2": {**base_headers, "User-Agent": "PostmanRuntime/7.36.0", "Accept": "*/*"},
+    }
+    body = body_variants["basic"]
+    for name, headers in header_variants.items():
         try:
-            resp = requests.post(url, headers=gori_client._headers(), json=body, timeout=15)
+            resp = requests.post(url, headers=headers, json=body, timeout=15)
             results.append({"variant": name, "status": resp.status_code, "body": resp.text[:500]})
         except Exception as e:
             results.append({"variant": name, "error": str(e)})
-    # also try GET with querystring, in case rates is a GET endpoint
+
+    # Try each body variant with the plain default headers too
+    for name, b in body_variants.items():
+        try:
+            resp = requests.post(url, headers=base_headers, json=b, timeout=15)
+            results.append({"variant": f"body_{name}", "status": resp.status_code, "body": resp.text[:500]})
+        except Exception as e:
+            results.append({"variant": f"body_{name}", "error": str(e)})
+
+    # Try compact JSON (no spaces) sent as raw data, in case of a body-size/parsing quirk
+    import json as _json
     try:
-        resp = requests.get(url, headers=gori_client._headers(), timeout=15)
-        results.append({"variant": "GET no body", "status": resp.status_code, "body": resp.text[:400]})
+        compact = _json.dumps(body, separators=(",", ":"))
+        resp = requests.post(url, headers={**base_headers}, data=compact, timeout=15)
+        results.append({"variant": "compact_raw", "status": resp.status_code, "body": resp.text[:500]})
     except Exception as e:
-        results.append({"variant": "GET no body", "error": str(e)})
+        results.append({"variant": "compact_raw", "error": str(e)})
+
     return results
