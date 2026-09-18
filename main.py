@@ -284,11 +284,26 @@ def debug_rates(auth: bool = Depends(check_auth)):
             except Exception as e:
                 results.append({"variant": name, "error": str(e)})
 
-        # also check what GET /v2/shipments (known-good per docs) returns, to sanity check auth/network at least
+        # Pull one full shipment record (untruncated) to see the real field schema
         try:
-            resp = requests.get("https://api.goricompany.com/v2/shipments?page_size=5&page=1", headers=headers, timeout=15)
-            results.append({"variant": "GET /v2/shipments", "status": resp.status_code, "body": resp.text[:400]})
+            resp = requests.get("https://api.goricompany.com/v2/shipments?page_size=1&page=1", headers=headers, timeout=15)
+            data = resp.json()
+            shipments = data.get("shipments", [])
+            results.append({"variant": "GET /v2/shipments FULL", "status": resp.status_code,
+                             "one_shipment": shipments[0] if shipments else data})
         except Exception as e:
-            results.append({"variant": "GET /v2/shipments", "error": str(e)})
+            results.append({"variant": "GET /v2/shipments FULL", "error": str(e)})
+
+        # Now retry rates using the "name" field (not first/last) seen in the real schema
+        try:
+            to_named = {"name": "Test Test", "street1": to_address["street1"], "city": to_address["city"],
+                        "state": to_address["state"], "zip": to_address["zip"], "country": to_address["country"]}
+            from_named = {"name": "SHIPPING DEPT", "street1": from_address["street1"], "city": from_address["city"],
+                          "state": from_address["state"], "zip": from_address["zip"], "country": from_address["country"]}
+            body2 = {"to_address": to_named, "from_address": from_named, "parcel": parcel}
+            resp = requests.post(url, headers=headers, json=body2, timeout=15)
+            results.append({"variant": "rates_with_name_field", "status": resp.status_code, "body": resp.text[:500]})
+        except Exception as e:
+            results.append({"variant": "rates_with_name_field", "error": str(e)})
 
     return results
