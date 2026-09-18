@@ -234,9 +234,29 @@ def pick_fallback(to_addr, from_addr, sheet_parcel, notes):
     return best["service"], sheet_parcel, best["fees"]["amount"], notes
 
 
+def _gofo_covers(to_addr):
+    """Fast coverage check against Vikaas's own direct GOFO account
+    (verifyDelivery), not the slower gori-mcp aggregator. Measured at
+    ~0.1s per call vs ~15-20s for a full multi-carrier get_rates call, so
+    this replaces "call GOFO through gori-mcp just to see if it errors" as
+    the way we learn whether an address is covered. Returns True/False;
+    treated as "not covered" (safe default) on any error, same as before."""
+    result = gofo_client.verify_delivery(
+        country=to_addr.get("country") or "US",
+        state=to_addr.get("state") or "",
+        city=to_addr.get("city") or "",
+        postal_code=to_addr.get("zip") or "",
+    )
+    return result.get("covered", False)
+
+
 def pick_service_and_parcel(to_addr, from_addr, sheet_parcel):
     """Returns (service, parcel_dict, rate_amount, notes)."""
     notes = []
+    if not _gofo_covers(to_addr):
+        notes.append("GOFO Ground doesn't cover this ZIP (checked directly with GOFO), falling back to cheapest of USPS/UPS Ground Saver/FedEx")
+        return pick_fallback(to_addr, from_addr, sheet_parcel, notes)
+
     try:
         gofo_rates = gori_client.get_rates(to_addr, from_addr, GOFO_OVERRIDE_PARCEL)
         gofo = next((r for r in gofo_rates if r.get("carrier") == "gofo" and r.get("service") == "gofo_ground" and "fees" in r), None)
@@ -247,55 +267,54 @@ def pick_service_and_parcel(to_addr, from_addr, sheet_parcel):
     if gofo:
         return "gofo_ground", GOFO_OVERRIDE_PARCEL, gofo["fees"]["amount"], notes
 
-    notes.append("GOFO Ground unavailable, falling back to cheapest of USPS/UPS Ground Saver/FedEx")
+    notes.append("GOFO Ground covers this ZIP but its rate/booking failed, falling back to cheapest of USPS/UPS Ground Saver/FedEx")
     return pick_fallback(to_addr, from_addr, sheet_parcel, notes)
 
 
 def _price_row(row):
     """Prices one row for the preview screen.
 
-    Order of operations (matches how GOFO coverage is actually determined -
-    by ZIP/address, not by box size):
-      1. Run the package through GOFO at its REAL sheet weight/dims first.
-         This is purely a coverage check: does GOFO serve this address at
-         all? The same call also gets us the USPS Ground Advantage price at
-         the real size for free, so it's used either way.
-      2. If GOFO does NOT show up in that response, GOFO doesn't serve this
-         ZIP - full stop. The real-dims USPS Ground Advantage price is final
-         for this row, and it's used for both "optimized" and "baseline"
-         (no synthetic savings to claim on a row GOFO was never going to
-         touch).
-      3. If GOFO DOES show up, only THEN do we ask what it would cost at the
-         reduced 4oz/6x4x4 box - and, in that same call, what USPS Ground
-         Advantage would cost at that same reduced box, for an apples-to-
-         apples "what would this same small box cost without GOFO" baseline.
+    Order of operations:
+      1. Ask GOFO directly (verifyDelivery, ~0.1s) whether it covers this
+         address at all - a coverage check, not a price quote, and not
+         dependent on box size.
+      2. If GOFO does NOT cover it, GOFO doesn't serve this ZIP - full stop.
+         Get USPS Ground Advantage at the sheet's real weight/dims (via
+         gori-mcp, since USPS pricing always goes through Gori) and use it
+         as the final price for both "optimized" and "baseline" columns -
+         no synthetic savings to claim on a row GOFO was never going to
+         touch.
+      3. If GOFO DOES cover it, ask what it would cost at the reduced
+         4oz/6x4x4 box - and, in that same call, what USPS Ground Advantage
+         would cost at that same reduced box, for an apples-to-apples "what
+         would this same small box cost without GOFO" baseline.
 
-    This means a GOFO-unavailable row costs one API call instead of two, and
-    "unavailable" always reflects real-world coverage rather than an
-    artifact of shrinking the box before checking.
+    Only one gori-mcp get_rates call is ever needed per row (the fast GOFO
+    coverage check is direct, not through gori-mcp), versus two before this
+    was wired up - roughly halving pricing time for GOFO-covered rows.
     """
     if row["error"]:
         return {"row_number": row["row_number"], "reference": row["reference_1"],
                  "error": row["error"]}
 
-    try:
-        rates_real = gori_client.get_rates(row["to_address"], row["from_address"], row["sheet_parcel_oz_in"])
-    except Exception:
-        rates_real = []
+    covered = _gofo_covers(row["to_address"])
 
-    gofo_at_real = next((r for r in rates_real if r.get("carrier") == "gofo" and r.get("service") == "gofo_ground" and "fees" in r), None)
-    usps_real = find_service(rates_real, USPS_GROUND_SERVICE)
-
-    if not gofo_at_real:
+    if not covered:
         # GOFO doesn't serve this address at all - real-dims USPS is final,
         # for both columns. This is also the rural/remote-ZIP signal.
+        try:
+            rates_real = gori_client.get_rates(row["to_address"], row["from_address"], row["sheet_parcel_oz_in"])
+            usps_real = find_service(rates_real, USPS_GROUND_SERVICE)
+        except Exception:
+            usps_real = None
+
         is_rural = bool(usps_real)
         optimized_service = USPS_GROUND_SERVICE
         optimized_amount = usps_real["fees"]["amount"] if usps_real else None
         baseline_amount = optimized_amount
     else:
-        # GOFO covers this address - now see what the shrunk box costs,
-        # for GOFO itself and for USPS at that same shrunk box.
+        # GOFO covers this address - see what the shrunk box costs, for
+        # GOFO itself and for USPS at that same shrunk box, in one call.
         try:
             rates_reduced = gori_client.get_rates(row["to_address"], row["from_address"], GOFO_OVERRIDE_PARCEL)
             gofo_best = next((r for r in rates_reduced if r.get("carrier") == "gofo" and r.get("service") == "gofo_ground" and "fees" in r), None)
@@ -310,9 +329,14 @@ def _price_row(row):
             optimized_amount = gofo_best["fees"]["amount"]
             baseline_amount = usps_reduced["fees"]["amount"] if usps_reduced else None
         else:
-            # Edge case: GOFO covered the address at real size but the
-            # reduced-box call itself failed - fall back to the real-dims
-            # USPS price we already have, same as the no-coverage case.
+            # Edge case: GOFO's own coverage check said yes, but its rate
+            # call itself failed - fall back to real-dims USPS, one more
+            # call, same as the no-coverage case.
+            try:
+                rates_real = gori_client.get_rates(row["to_address"], row["from_address"], row["sheet_parcel_oz_in"])
+                usps_real = find_service(rates_real, USPS_GROUND_SERVICE)
+            except Exception:
+                usps_real = None
             optimized_service = USPS_GROUND_SERVICE
             optimized_amount = usps_real["fees"]["amount"] if usps_real else None
             baseline_amount = optimized_amount
@@ -685,15 +709,3 @@ def get_pdf(pdf_token: str, auth: bool = Depends(check_auth)):
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-
-# ---------------------------------------------------------------------------
-# TEMPORARY: direct GOFO speed/correctness test. Not linked from the UI -
-# hit it manually while validating the direct-GOFO coverage check. Remove
-# once we've confirmed it and wired the real check into pricing.
-# ---------------------------------------------------------------------------
-@app.get("/debug/gofo-verify")
-def debug_gofo_verify(zip: str, state: str = "", city: str = "", country: str = "US",
-                       auth: bool = Depends(check_auth)):
-    result = gofo_client.verify_delivery(country=country, state=state, city=city, postal_code=zip)
-    return result
