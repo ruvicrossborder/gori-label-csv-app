@@ -3,6 +3,7 @@ import io
 import uuid
 import secrets
 import datetime
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
@@ -26,10 +27,17 @@ security = HTTPBasic()
 _BATCHES = {}   # token -> {"rows": [...]}
 _PDFS = {}      # token -> {"bytes": b"...", "filename": "..."}
 
+# Rate lookups / label creation for a whole batch happen in a background
+# thread, polled by the browser via auto-refreshing pages, instead of inside
+# a single long-lived HTTP request. Railway's proxy (and some browsers) will
+# kill a request that sits open for 60-100s, which large batches (50+ rows)
+# could easily exceed even with the rows themselves fanned out in parallel.
+_PREVIEWS = {}  # token -> {"status": "processing"|"done"|"error", ...}
+_RESULTS = {}   # token -> {"status": "processing"|"done"|"error", ...}
+
 # Rows are independent of each other, so rate lookups / label creation for a
 # whole batch are fanned out across a small thread pool instead of running
-# one row at a time - a 60+ row batch was otherwise taking minutes and timing
-# out the request (each row makes 1-4 sequential network calls to gori-mcp).
+# one row at a time - a 60+ row batch was otherwise taking minutes.
 _MAX_WORKERS = 12
 
 
@@ -120,6 +128,10 @@ a{color:var(--ink)}
   width:14px;height:14px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;
   border-radius:50%;display:inline-block;animation:spin .7s linear infinite;
 }
+.spinner-lg{
+  width:26px;height:26px;border:3px solid rgba(0,0,0,.12);border-top-color:var(--ink);
+  border-radius:50%;display:inline-block;animation:spin .8s linear infinite;
+}
 @keyframes spin{to{transform:rotate(360deg)}}
 .fade-in{animation:fadeIn .25s ease}
 @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
@@ -143,11 +155,29 @@ formatting), then priced through GOFO Ground first and the cheapest fallback car
 document.getElementById('uploadForm').addEventListener('submit', function(){
   var btn = document.getElementById('submitBtn');
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Calculating rates…';
+  btn.innerHTML = '<span class="spinner"></span> Uploading…';
 });
 </script>
 </body></html>
 """
+
+
+def waiting_page(poll_url, message):
+    """A lightweight page that auto-refreshes itself until the background job
+    behind poll_url is done. Keeps every single HTTP request short (well
+    under any proxy/browser timeout), no matter how long the whole batch
+    takes end to end."""
+    return PAGE_HEAD + f"""
+    <meta http-equiv="refresh" content="3;url={poll_url}">
+    <div class="fade-in">
+    <div class="card" style="text-align:center;padding:64px 28px">
+    <span class="spinner-lg"></span>
+    <p class="muted" style="margin-top:18px">{message}</p>
+    <p class="muted" style="font-size:12px;margin-top:6px">This page refreshes itself automatically — you can leave it open.</p>
+    </div>
+    </div>
+    </body></html>
+    """
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -196,58 +226,51 @@ def pick_service_and_parcel(to_addr, from_addr, sheet_parcel):
     return pick_fallback(to_addr, from_addr, sheet_parcel, notes)
 
 
-# ---------------------------------------------------------------------------
-# Step 1: preview rates & savings before anything is purchased
-# ---------------------------------------------------------------------------
-@app.post("/preview", response_class=HTMLResponse)
-async def preview(auth: bool = Depends(check_auth), file: UploadFile = File(...)):
-    content = await file.read()
+def _price_row(row):
+    if row["error"]:
+        return {"row_number": row["row_number"], "reference": row["reference_1"],
+                 "error": row["error"]}
+
     try:
-        rows = parse_and_fix(content, filename=file.filename)
+        orig_rates = gori_client.get_rates(row["to_address"], row["from_address"], row["sheet_parcel_oz_in"])
+        orig_best = cheapest_rate(orig_rates)
+    except Exception:
+        orig_best = None
+
+    try:
+        gofo_rates = gori_client.get_rates(row["to_address"], row["from_address"], GOFO_OVERRIDE_PARCEL)
+        gofo_best = next((r for r in gofo_rates if r.get("carrier") == "gofo" and r.get("service") == "gofo_ground" and "fees" in r), None)
+    except Exception:
+        gofo_best = None
+
+    # GOFO's own service area excludes most rural/remote ZIPs, so a valid
+    # address that GOFO can't quote is a reliable proxy for "rural/hard to reach".
+    is_rural = bool(orig_best) and not gofo_best
+
+    orig_amount = orig_best["fees"]["amount"] if orig_best else None
+    gofo_amount = gofo_best["fees"]["amount"] if gofo_best else None
+
+    return {
+        "row_number": row["row_number"],
+        "reference": row["reference_1"],
+        "orig_service": orig_best.get("service") if orig_best else None,
+        "orig_amount": orig_amount,
+        "gofo_amount": gofo_amount,
+        "is_rural": is_rural,
+        "error": None,
+    }
+
+
+def _run_preview_job(token, rows):
+    try:
+        with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+            preview_rows = list(executor.map(_price_row, rows))
+        _PREVIEWS[token] = {"status": "done", "preview_rows": preview_rows}
     except Exception as e:
-        return HTMLResponse(PAGE_HEAD + f"<div class='card fade-in'><p class='status-err'>Could not read file: {e}</p>"
-                             f"<p><a href='/'>&larr; Back</a></p></div></body></html>", status_code=400)
+        _PREVIEWS[token] = {"status": "error", "message": str(e)}
 
-    token = uuid.uuid4().hex
-    _BATCHES[token] = {"rows": rows}
 
-    def _price_row(row):
-        if row["error"]:
-            return {"row_number": row["row_number"], "reference": row["reference_1"],
-                     "error": row["error"]}
-
-        try:
-            orig_rates = gori_client.get_rates(row["to_address"], row["from_address"], row["sheet_parcel_oz_in"])
-            orig_best = cheapest_rate(orig_rates)
-        except Exception:
-            orig_best = None
-
-        try:
-            gofo_rates = gori_client.get_rates(row["to_address"], row["from_address"], GOFO_OVERRIDE_PARCEL)
-            gofo_best = next((r for r in gofo_rates if r.get("carrier") == "gofo" and r.get("service") == "gofo_ground" and "fees" in r), None)
-        except Exception:
-            gofo_best = None
-
-        # GOFO's own service area excludes most rural/remote ZIPs, so a valid
-        # address that GOFO can't quote is a reliable proxy for "rural/hard to reach".
-        is_rural = bool(orig_best) and not gofo_best
-
-        orig_amount = orig_best["fees"]["amount"] if orig_best else None
-        gofo_amount = gofo_best["fees"]["amount"] if gofo_best else None
-
-        return {
-            "row_number": row["row_number"],
-            "reference": row["reference_1"],
-            "orig_service": orig_best.get("service") if orig_best else None,
-            "orig_amount": orig_amount,
-            "gofo_amount": gofo_amount,
-            "is_rural": is_rural,
-            "error": None,
-        }
-
-    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
-        preview_rows = list(executor.map(_price_row, rows))
-
+def render_preview_page(token, preview_rows):
     total_original = 0.0
     total_gofo = 0.0
     priced_count = 0
@@ -292,7 +315,7 @@ async def preview(auth: bool = Depends(check_auth), file: UploadFile = File(...)
         if rural_count else ""
     )
 
-    html = PAGE_HEAD + f"""
+    return PAGE_HEAD + f"""
     <div class="fade-in">
     <div class="top-nav"><h1>Rate Preview</h1><a href="/">&larr; Upload a different file</a></div>
     <p class="subtitle">Estimated cost across {priced_count} priceable rows, before any label is purchased.</p>
@@ -324,43 +347,94 @@ async def preview(auth: bool = Depends(check_auth), file: UploadFile = File(...)
     document.getElementById('processForm').addEventListener('submit', function(){{
       var btn = document.getElementById('processBtn');
       btn.disabled = true;
-      btn.innerHTML = '<span class="spinner"></span> Creating labels…';
+      btn.innerHTML = '<span class="spinner"></span> Starting…';
     }});
     </script>
     </body></html>
     """
-    return HTMLResponse(html)
+
+
+# ---------------------------------------------------------------------------
+# Step 1: preview rates & savings before anything is purchased
+# ---------------------------------------------------------------------------
+@app.post("/preview", response_class=HTMLResponse)
+async def preview(auth: bool = Depends(check_auth), file: UploadFile = File(...)):
+    content = await file.read()
+    try:
+        rows = parse_and_fix(content, filename=file.filename)
+    except Exception as e:
+        return HTMLResponse(PAGE_HEAD + f"<div class='card fade-in'><p class='status-err'>Could not read file: {e}</p>"
+                             f"<p><a href='/'>&larr; Back</a></p></div></body></html>", status_code=400)
+
+    token = uuid.uuid4().hex
+    _BATCHES[token] = {"rows": rows}
+    _PREVIEWS[token] = {"status": "processing"}
+
+    threading.Thread(target=_run_preview_job, args=(token, rows), daemon=True).start()
+
+    return HTMLResponse(waiting_page(f"/preview/{token}", f"Pricing {len(rows)} row(s) against GOFO Ground and the fallback carriers…"))
+
+
+@app.get("/preview/{token}", response_class=HTMLResponse)
+def preview_status(token: str, auth: bool = Depends(check_auth)):
+    entry = _PREVIEWS.get(token)
+    if not entry:
+        return HTMLResponse(PAGE_HEAD + "<div class='card fade-in'><p class='status-err'>This preview has expired or was already used."
+                             " Please upload the file again.</p><p><a href='/'>&larr; Back</a></p></div></body></html>",
+                             status_code=404)
+
+    if entry["status"] == "processing":
+        rows = _BATCHES.get(token, {}).get("rows", [])
+        return HTMLResponse(waiting_page(f"/preview/{token}", f"Pricing {len(rows)} row(s) against GOFO Ground and the fallback carriers…"))
+
+    if entry["status"] == "error":
+        return HTMLResponse(PAGE_HEAD + f"<div class='card fade-in'><p class='status-err'>Something went wrong while pricing: {entry.get('message')}</p>"
+                             f"<p><a href='/'>&larr; Back</a></p></div></body></html>", status_code=500)
+
+    return HTMLResponse(render_preview_page(token, entry["preview_rows"]))
 
 
 # ---------------------------------------------------------------------------
 # Step 2: actually create the labels for a previewed batch
 # ---------------------------------------------------------------------------
-@app.post("/process", response_class=HTMLResponse)
-async def process(auth: bool = Depends(check_auth), token: str = Form(...)):
-    batch = _BATCHES.get(token)
-    if not batch:
-        return HTMLResponse(PAGE_HEAD + "<div class='card fade-in'><p class='status-err'>This preview has expired."
-                             " Please upload the file again.</p><p><a href='/'>&larr; Back</a></p></div></body></html>",
-                             status_code=404)
-    rows = batch["rows"]
-
-    def _create_row(row):
-        r = {"row_number": row["row_number"], "fixes": row["fixes"], "reference": row["reference_1"]}
-        if row["error"]:
+def _create_row(row):
+    r = {"row_number": row["row_number"], "fixes": row["fixes"], "reference": row["reference_1"]}
+    if row["error"]:
+        r["status"] = "error"
+        r["message"] = row["error"]
+        return r
+    try:
+        service, parcel, amount, notes = pick_service_and_parcel(
+            row["to_address"], row["from_address"], row["sheet_parcel_oz_in"]
+        )
+        r["fixes"] = r["fixes"] + notes
+        if not service:
             r["status"] = "error"
-            r["message"] = row["error"]
+            r["message"] = "No carrier available (GOFO and all fallbacks failed)"
             return r
-        try:
-            service, parcel, amount, notes = pick_service_and_parcel(
-                row["to_address"], row["from_address"], row["sheet_parcel_oz_in"]
-            )
-            r["fixes"] = r["fixes"] + notes
-            if not service:
-                r["status"] = "error"
-                r["message"] = "No carrier available (GOFO and all fallbacks failed)"
-                return r
 
-            try:
+        try:
+            shipment = gori_client.create_shipment(
+                service=service,
+                to_address=row["to_address"],
+                from_address=row["from_address"],
+                parcel=parcel,
+                reference_1=row["reference_1"],
+                reference_2=row["reference_2"],
+            )
+        except Exception as e:
+            if service == "gofo_ground":
+                # GOFO sometimes quotes fine but fails at actual booking time
+                # (provider-side issue) - fall back to the next best carrier.
+                r["fixes"].append(f"GOFO Ground booking failed ({e}), falling back to cheapest of USPS/UPS Ground Saver/FedEx")
+                service, parcel, amount, fb_notes = pick_fallback(
+                    row["to_address"], row["from_address"], row["sheet_parcel_oz_in"], []
+                )
+                r["fixes"] = r["fixes"] + fb_notes
+                if not service:
+                    r["status"] = "error"
+                    r["message"] = "GOFO booking failed and no fallback carrier available"
+                    return r
                 shipment = gori_client.create_shipment(
                     service=service,
                     to_address=row["to_address"],
@@ -369,58 +443,59 @@ async def process(auth: bool = Depends(check_auth), token: str = Form(...)):
                     reference_1=row["reference_1"],
                     reference_2=row["reference_2"],
                 )
-            except Exception as e:
-                if service == "gofo_ground":
-                    # GOFO sometimes quotes fine but fails at actual booking time
-                    # (provider-side issue) - fall back to the next best carrier.
-                    r["fixes"].append(f"GOFO Ground booking failed ({e}), falling back to cheapest of USPS/UPS Ground Saver/FedEx")
-                    service, parcel, amount, fb_notes = pick_fallback(
-                        row["to_address"], row["from_address"], row["sheet_parcel_oz_in"], []
-                    )
-                    r["fixes"] = r["fixes"] + fb_notes
-                    if not service:
-                        r["status"] = "error"
-                        r["message"] = "GOFO booking failed and no fallback carrier available"
-                        return r
-                    shipment = gori_client.create_shipment(
-                        service=service,
-                        to_address=row["to_address"],
-                        from_address=row["from_address"],
-                        parcel=parcel,
-                        reference_1=row["reference_1"],
-                        reference_2=row["reference_2"],
-                    )
-                else:
-                    raise
+            else:
+                raise
 
-            label_info = shipment.get("label") or {}
-            label_url = (
-                label_info.get("image_url") if isinstance(label_info, dict) else label_info
-            ) or shipment.get("label_url") or shipment.get("label_pdf_url")
-            tracking = shipment.get("tracking_code") or shipment.get("tracking_number")
-            r["status"] = "ok"
-            r["service"] = service
-            r["cost"] = amount
-            r["tracking"] = tracking
-            r["label_url"] = label_url
-            return r
-        except Exception as e:
-            r["status"] = "error"
-            r["message"] = f"{e}"
-            return r
+        label_info = shipment.get("label") or {}
+        label_url = (
+            label_info.get("image_url") if isinstance(label_info, dict) else label_info
+        ) or shipment.get("label_url") or shipment.get("label_pdf_url")
+        tracking = shipment.get("tracking_code") or shipment.get("tracking_number")
+        r["status"] = "ok"
+        r["service"] = service
+        r["cost"] = amount
+        r["tracking"] = tracking
+        r["label_url"] = label_url
+        return r
+    except Exception as e:
+        r["status"] = "error"
+        r["message"] = f"{e}"
+        return r
 
-    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
-        results = list(executor.map(_create_row, rows))
 
-    label_urls = [r["label_url"] for r in results if r.get("label_url")]
+def _run_process_job(token, rows):
+    try:
+        with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+            results = list(executor.map(_create_row, rows))
 
-    _BATCHES.pop(token, None)
+        label_urls = [r["label_url"] for r in results if r.get("label_url")]
+
+        pdf_token = None
+        if label_urls:
+            pdf_bytes, filename = build_batch_pdf(results, label_urls)
+            pdf_token = uuid.uuid4().hex
+            _PDFS[pdf_token] = {"bytes": pdf_bytes, "filename": filename}
+
+        _RESULTS[token] = {
+            "status": "done",
+            "results": results,
+            "label_urls": label_urls,
+            "pdf_token": pdf_token,
+        }
+        _BATCHES.pop(token, None)
+    except Exception as e:
+        _RESULTS[token] = {"status": "error", "message": str(e)}
+
+
+def render_results_page(entry):
+    results = entry["results"]
+    label_urls = entry["label_urls"]
+    pdf_token = entry.get("pdf_token")
 
     pdf_link_html = ""
-    if label_urls:
-        pdf_bytes, filename = build_batch_pdf(results, label_urls)
-        pdf_token = uuid.uuid4().hex
-        _PDFS[pdf_token] = {"bytes": pdf_bytes, "filename": filename}
+    if pdf_token:
+        pdf_entry = _PDFS.get(pdf_token, {})
+        filename = pdf_entry.get("filename", "labels.pdf")
         pdf_link_html = (
             f"<p><a class='btn' href='/pdf/{pdf_token}' target='_blank'>Open combined PDF in a new tab</a>"
             f"<span class='muted' style='margin-left:10px'>{filename} &mdash; copy the tab's URL to share it</span></p>"
@@ -442,7 +517,7 @@ async def process(auth: bool = Depends(check_auth), token: str = Form(...)):
                 f"<td class='status-err'>FAILED</td><td colspan='3'>{r.get('message','')}</td><td>{fixes_html}</td></tr>"
             )
 
-    html = PAGE_HEAD + f"""
+    return PAGE_HEAD + f"""
     <div class="fade-in">
     <div class="top-nav"><h1>Results</h1><a href="/">&larr; Upload another file</a></div>
     <div class="card">
@@ -461,7 +536,41 @@ async def process(auth: bool = Depends(check_auth), token: str = Form(...)):
     </div>
     </body></html>
     """
-    return HTMLResponse(html)
+
+
+@app.post("/process", response_class=HTMLResponse)
+async def process(auth: bool = Depends(check_auth), token: str = Form(...)):
+    batch = _BATCHES.get(token)
+    if not batch:
+        return HTMLResponse(PAGE_HEAD + "<div class='card fade-in'><p class='status-err'>This preview has expired."
+                             " Please upload the file again.</p><p><a href='/'>&larr; Back</a></p></div></body></html>",
+                             status_code=404)
+    rows = batch["rows"]
+    _RESULTS[token] = {"status": "processing"}
+
+    threading.Thread(target=_run_process_job, args=(token, rows), daemon=True).start()
+
+    return HTMLResponse(waiting_page(f"/results/{token}", f"Creating {len(rows)} label(s)…"))
+
+
+@app.get("/results/{token}", response_class=HTMLResponse)
+def results_status(token: str, auth: bool = Depends(check_auth)):
+    entry = _RESULTS.get(token)
+    if not entry:
+        return HTMLResponse(PAGE_HEAD + "<div class='card fade-in'><p class='status-err'>This batch has expired or was already viewed."
+                             " Please upload the file again.</p><p><a href='/'>&larr; Back</a></p></div></body></html>",
+                             status_code=404)
+
+    if entry["status"] == "processing":
+        rows = _BATCHES.get(token, {}).get("rows", [])
+        count = len(rows) if rows else ""
+        return HTMLResponse(waiting_page(f"/results/{token}", f"Creating {count} label(s)…".replace("  ", " ")))
+
+    if entry["status"] == "error":
+        return HTMLResponse(PAGE_HEAD + f"<div class='card fade-in'><p class='status-err'>Something went wrong while creating labels: {entry.get('message')}</p>"
+                             f"<p><a href='/'>&larr; Back</a></p></div></body></html>", status_code=500)
+
+    return HTMLResponse(render_results_page(entry))
 
 
 @app.get("/pdf/{pdf_token}")
