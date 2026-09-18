@@ -122,11 +122,11 @@ a{color:var(--ink)}
 UPLOAD_FORM = PAGE_HEAD + """
 <div class="fade-in">
 <h1>Gori Label Batch Uploader</h1>
-<p class="subtitle">Upload a shipment CSV. Rows are auto-corrected (units, state codes, zip/phone
+<p class="subtitle">Upload a shipment CSV or Excel file (.csv, .xlsx, .xls). Rows are auto-corrected (units, state codes, zip/phone
 formatting), then priced through GOFO Ground first and the cheapest fallback carrier when needed.</p>
 <div class="card">
 <form id="uploadForm" action="/preview" method="post" enctype="multipart/form-data">
-<input type="file" name="file" accept=".csv" required>
+<input type="file" name="file" accept=".csv,.xlsx,.xlsm,.xls" required>
 <br><br>
 <button type="submit" id="submitBtn">Preview rates &amp; savings</button>
 </form>
@@ -196,9 +196,9 @@ def pick_service_and_parcel(to_addr, from_addr, sheet_parcel):
 async def preview(auth: bool = Depends(check_auth), file: UploadFile = File(...)):
     content = await file.read()
     try:
-        rows = parse_and_fix(content)
+        rows = parse_and_fix(content, filename=file.filename)
     except Exception as e:
-        return HTMLResponse(PAGE_HEAD + f"<div class='card fade-in'><p class='status-err'>Could not read CSV: {e}</p>"
+        return HTMLResponse(PAGE_HEAD + f"<div class='card fade-in'><p class='status-err'>Could not read file: {e}</p>"
                              f"<p><a href='/'>&larr; Back</a></p></div></body></html>", status_code=400)
 
     token = uuid.uuid4().hex
