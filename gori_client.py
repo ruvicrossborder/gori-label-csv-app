@@ -53,7 +53,7 @@ def _request(method, path, json_body=None, params=None):
 
 
 def get_rates(to_address, from_address, parcel):
-    resp = _request("POST", "/rates", json_body={
+    resp = _request("POST", "/shipments/rates", json_body={
         "to_address": to_address,
         "from_address": from_address,
         "parcel": parcel,
