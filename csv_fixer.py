@@ -1,10 +1,14 @@
-"""Parses the uploaded shipment CSV, auto-fixes common mistakes, and returns
-normalized rows ready for rate/label calls, along with a per-row list of the
-fixes that were applied (so we can show the user what changed)."""
+"""Parses the uploaded shipment file (CSV or Excel, .xlsx/.xlsm/.xls), auto-fixes
+common mistakes, and returns normalized rows ready for rate/label calls, along
+with a per-row list of the fixes that were applied (so we can show the user
+what changed)."""
 
 import csv
 import io
+import os
 import re
+
+import smart_mapper
 
 STATE_NAME_TO_ABBR = {
     "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR", "california": "CA",
@@ -130,16 +134,117 @@ def _to_in(value, unit, fixes, label):
     return val
 
 
-def parse_and_fix(file_bytes):
-    """Returns a list of dicts: {row_number, fixes, to_address, from_address,
-    parcel_oz_in, reference_1, error}"""
+def _read_csv_rows(file_bytes):
+    """Yields (row_number, raw_row_dict) from CSV bytes."""
     text = file_bytes.decode("utf-8-sig", errors="replace")
     reader = csv.DictReader(io.StringIO(text))
-    rows = []
     for i, raw_row in enumerate(reader, start=2):  # header is row 1
+        yield i, raw_row
+
+
+def _read_xlsx_rows(file_bytes):
+    """Yields (row_number, raw_row_dict) from a modern Excel file (.xlsx/.xlsm),
+    using openpyxl. Cell values are stringified to match CSV behavior."""
+    import openpyxl
+
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
+    ws = wb.active
+    rows_iter = ws.iter_rows(values_only=True)
+    try:
+        header = next(rows_iter)
+    except StopIteration:
+        return
+    headers = [str(h).strip() if h is not None else "" for h in header]
+    for i, raw in enumerate(rows_iter, start=2):
+        if raw is None or all(v is None or str(v).strip() == "" for v in raw):
+            continue
+        row = {}
+        for h, v in zip(headers, raw):
+            if not h:
+                continue
+            row[h] = "" if v is None else str(v).strip()
+        yield i, row
+
+
+def _read_xls_rows(file_bytes):
+    """Yields (row_number, raw_row_dict) from a legacy Excel file (.xls),
+    using xlrd. Cell values are stringified to match CSV behavior."""
+    import xlrd
+
+    book = xlrd.open_workbook(file_contents=file_bytes)
+    sheet = book.sheet_by_index(0)
+    if sheet.nrows == 0:
+        return
+    headers = [str(sheet.cell_value(0, c)).strip() for c in range(sheet.ncols)]
+    for r in range(1, sheet.nrows):
+        values = [sheet.cell_value(r, c) for c in range(sheet.ncols)]
+        if all(v == "" or v is None for v in values):
+            continue
+        row = {}
+        for h, v in zip(headers, values):
+            if not h:
+                continue
+            if isinstance(v, float) and v == int(v):
+                v = int(v)  # avoid "5.0" for integer-like Excel numbers
+            row[h] = "" if v is None else str(v).strip()
+        yield r + 1, row
+
+
+def _detect_and_read_rows(file_bytes, filename):
+    """Sniffs the file type (by extension first, then magic bytes) and returns
+    a (row_number, raw_row_dict) generator."""
+    ext = (filename or "").rsplit(".", 1)[-1].lower() if filename and "." in filename else ""
+
+    if ext in ("xlsx", "xlsm"):
+        return _read_xlsx_rows(file_bytes)
+    if ext == "xls":
+        return _read_xls_rows(file_bytes)
+    if ext == "csv":
+        return _read_csv_rows(file_bytes)
+
+    # No usable extension (or an unrecognized one) - sniff the actual bytes.
+    if file_bytes[:4] == b"PK\x03\x04":  # .xlsx/.xlsm are zip archives
+        return _read_xlsx_rows(file_bytes)
+    if file_bytes[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":  # legacy .xls OLE header
+        return _read_xls_rows(file_bytes)
+    return _read_csv_rows(file_bytes)
+
+
+def parse_and_fix(file_bytes, filename=None):
+    """Returns a list of dicts: {row_number, fixes, to_address, from_address,
+    parcel_oz_in, reference_1, error}. Accepts CSV or Excel (.xlsx/.xlsm/.xls).
+
+    If the file's columns don't match the app's expected headers, this tries
+    an AI-based column mapping (needs OPENAI_API_KEY) so odd/relabeled sheets
+    still work rather than failing outright."""
+    raw_rows = list(_detect_and_read_rows(file_bytes, filename))
+
+    header_mapping = None
+    ai_error = None
+    if raw_rows:
+        headers = list(raw_rows[0][1].keys())
+        if smart_mapper.needs_smart_mapping(headers):
+            if os.environ.get("OPENAI_API_KEY"):
+                try:
+                    sample = [r for _, r in raw_rows[:3]]
+                    header_mapping = smart_mapper.map_headers_with_ai(headers, sample)
+                except Exception as e:
+                    ai_error = str(e)
+            else:
+                ai_error = "columns don't match the expected template, and OPENAI_API_KEY isn't set for automatic mapping"
+
+    rows = []
+    for i, raw_row in raw_rows:
         fixes = []
         error = None
-        row = {k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in raw_row.items() if k}
+        if header_mapping:
+            mapped_row = smart_mapper.apply_mapping(raw_row, header_mapping)
+            fixes.append("Columns auto-mapped by AI (file didn't use the expected template)")
+            row = {k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in mapped_row.items() if k}
+        else:
+            if ai_error:
+                fixes.append(f"Note: {ai_error}")
+            row = {k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in raw_row.items() if k}
 
         weight_unit = row.get("Weight Unit*", "oz")
         dim_unit = row.get("Dim Unit*", "in")
