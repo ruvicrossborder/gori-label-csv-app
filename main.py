@@ -294,16 +294,26 @@ def debug_rates(auth: bool = Depends(check_auth)):
         except Exception as e:
             results.append({"variant": "GET /v2/shipments FULL", "error": str(e)})
 
-        # Now retry rates using the "name" field (not first/last) seen in the real schema
-        try:
-            to_named = {"name": "Test Test", "street1": to_address["street1"], "city": to_address["city"],
-                        "state": to_address["state"], "zip": to_address["zip"], "country": to_address["country"]}
-            from_named = {"name": "SHIPPING DEPT", "street1": from_address["street1"], "city": from_address["city"],
-                          "state": from_address["state"], "zip": from_address["zip"], "country": from_address["country"]}
-            body2 = {"to_address": to_named, "from_address": from_named, "parcel": parcel}
-            resp = requests.post(url, headers=headers, json=body2, timeout=15)
-            results.append({"variant": "rates_with_name_field", "status": resp.status_code, "body": resp.text[:500]})
-        except Exception as e:
-            results.append({"variant": "rates_with_name_field", "error": str(e)})
+        # Real schema uses "name" (not first/last). Try POST /v2/shipments itself
+        # without a "service" - maybe that's how you get a rate quote (shipment-as-quote pattern).
+        to_named = {"name": "Test Test", "street1": to_address["street1"], "city": to_address["city"],
+                    "state": to_address["state"], "zip": to_address["zip"], "country": to_address["country"]}
+        from_named = {"name": "SHIPPING DEPT", "street1": from_address["street1"], "city": from_address["city"],
+                      "state": from_address["state"], "zip": from_address["zip"], "country": from_address["country"]}
+
+        shipments_url = "https://api.goricompany.com/v2/shipments"
+        post_variants = {
+            "no_service": {"to_address": to_named, "from_address": from_named, "parcel": parcel},
+            "carrier_all": {"to_address": to_named, "from_address": from_named, "parcel": parcel, "carrier": "all"},
+            "rate_true": {"to_address": to_named, "from_address": from_named, "parcel": parcel, "rate": True},
+            "quote_true": {"to_address": to_named, "from_address": from_named, "parcel": parcel, "quote": True},
+            "with_service_ground_advantage": {"to_address": to_named, "from_address": from_named, "parcel": parcel, "service": "ground_advantage"},
+        }
+        for name, b in post_variants.items():
+            try:
+                resp = requests.post(shipments_url, headers=headers, json=b, timeout=15)
+                results.append({"variant": f"POST_shipments_{name}", "status": resp.status_code, "body": resp.text[:500]})
+            except Exception as e:
+                results.append({"variant": f"POST_shipments_{name}", "error": str(e)})
 
     return results
