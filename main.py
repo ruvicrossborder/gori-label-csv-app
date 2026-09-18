@@ -3,6 +3,7 @@ import io
 import uuid
 import secrets
 import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -24,6 +25,12 @@ security = HTTPBasic()
 # In-memory stores (single-process app). Keyed by short-lived tokens.
 _BATCHES = {}   # token -> {"rows": [...]}
 _PDFS = {}      # token -> {"bytes": b"...", "filename": "..."}
+
+# Rows are independent of each other, so rate lookups / label creation for a
+# whole batch are fanned out across a small thread pool instead of running
+# one row at a time - a 60+ row batch was otherwise taking minutes and timing
+# out the request (each row makes 1-4 sequential network calls to gori-mcp).
+_MAX_WORKERS = 12
 
 
 def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
@@ -204,21 +211,15 @@ async def preview(auth: bool = Depends(check_auth), file: UploadFile = File(...)
     token = uuid.uuid4().hex
     _BATCHES[token] = {"rows": rows}
 
-    preview_rows = []
-    total_original = 0.0
-    total_gofo = 0.0
-    priced_count = 0
-    rural_count = 0
-
-    for row in rows:
+    def _price_row(row):
         if row["error"]:
-            preview_rows.append({"row_number": row["row_number"], "reference": row["reference_1"],
-                                  "error": row["error"]})
-            continue
+            return {"row_number": row["row_number"], "reference": row["reference_1"],
+                     "error": row["error"]}
+
         try:
             orig_rates = gori_client.get_rates(row["to_address"], row["from_address"], row["sheet_parcel_oz_in"])
             orig_best = cheapest_rate(orig_rates)
-        except Exception as e:
+        except Exception:
             orig_best = None
 
         try:
@@ -230,23 +231,11 @@ async def preview(auth: bool = Depends(check_auth), file: UploadFile = File(...)
         # GOFO's own service area excludes most rural/remote ZIPs, so a valid
         # address that GOFO can't quote is a reliable proxy for "rural/hard to reach".
         is_rural = bool(orig_best) and not gofo_best
-        if is_rural:
-            rural_count += 1
 
         orig_amount = orig_best["fees"]["amount"] if orig_best else None
         gofo_amount = gofo_best["fees"]["amount"] if gofo_best else None
 
-        if orig_amount is not None:
-            total_original += orig_amount
-        if gofo_amount is not None:
-            total_gofo += gofo_amount
-        elif orig_amount is not None:
-            total_gofo += orig_amount  # GOFO unavailable, this row will fall back to the same price
-
-        if orig_amount is not None or gofo_amount is not None:
-            priced_count += 1
-
-        preview_rows.append({
+        return {
             "row_number": row["row_number"],
             "reference": row["reference_1"],
             "orig_service": orig_best.get("service") if orig_best else None,
@@ -254,7 +243,28 @@ async def preview(auth: bool = Depends(check_auth), file: UploadFile = File(...)
             "gofo_amount": gofo_amount,
             "is_rural": is_rural,
             "error": None,
-        })
+        }
+
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+        preview_rows = list(executor.map(_price_row, rows))
+
+    total_original = 0.0
+    total_gofo = 0.0
+    priced_count = 0
+    rural_count = 0
+    for pr in preview_rows:
+        if pr.get("is_rural"):
+            rural_count += 1
+        orig_amount = pr.get("orig_amount")
+        gofo_amount = pr.get("gofo_amount")
+        if orig_amount is not None:
+            total_original += orig_amount
+        if gofo_amount is not None:
+            total_gofo += gofo_amount
+        elif orig_amount is not None:
+            total_gofo += orig_amount  # GOFO unavailable, this row will fall back to the same price
+        if orig_amount is not None or gofo_amount is not None:
+            priced_count += 1
 
     savings = total_original - total_gofo
 
@@ -334,15 +344,12 @@ async def process(auth: bool = Depends(check_auth), token: str = Form(...)):
                              status_code=404)
     rows = batch["rows"]
 
-    results = []
-    label_urls = []
-    for row in rows:
+    def _create_row(row):
         r = {"row_number": row["row_number"], "fixes": row["fixes"], "reference": row["reference_1"]}
         if row["error"]:
             r["status"] = "error"
             r["message"] = row["error"]
-            results.append(r)
-            continue
+            return r
         try:
             service, parcel, amount, notes = pick_service_and_parcel(
                 row["to_address"], row["from_address"], row["sheet_parcel_oz_in"]
@@ -351,8 +358,7 @@ async def process(auth: bool = Depends(check_auth), token: str = Form(...)):
             if not service:
                 r["status"] = "error"
                 r["message"] = "No carrier available (GOFO and all fallbacks failed)"
-                results.append(r)
-                continue
+                return r
 
             try:
                 shipment = gori_client.create_shipment(
@@ -375,8 +381,7 @@ async def process(auth: bool = Depends(check_auth), token: str = Form(...)):
                     if not service:
                         r["status"] = "error"
                         r["message"] = "GOFO booking failed and no fallback carrier available"
-                        results.append(r)
-                        continue
+                        return r
                     shipment = gori_client.create_shipment(
                         service=service,
                         to_address=row["to_address"],
@@ -398,13 +403,16 @@ async def process(auth: bool = Depends(check_auth), token: str = Form(...)):
             r["cost"] = amount
             r["tracking"] = tracking
             r["label_url"] = label_url
-            if label_url:
-                label_urls.append(label_url)
-            results.append(r)
+            return r
         except Exception as e:
             r["status"] = "error"
             r["message"] = f"{e}"
-            results.append(r)
+            return r
+
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+        results = list(executor.map(_create_row, rows))
+
+    label_urls = [r["label_url"] for r in results if r.get("label_url")]
 
     _BATCHES.pop(token, None)
 
