@@ -213,3 +213,42 @@ def download_pdf(auth: bool = Depends(check_auth)):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/debug-auth")
+def debug_auth(auth: bool = Depends(check_auth)):
+    """Temporary diagnostic: try a handful of plausible Gori auth endpoints/bases
+    and report which one actually returns a token, so we can pin down the real
+    API surface without guessing blind."""
+    import requests as _requests
+    candidates = [
+        ("https://api.goricompany.com/auth/token", "json"),
+        ("https://api.goricompany.com/oauth/token", "json"),
+        ("https://api.goricompany.com/v2/auth/token", "json"),
+        ("https://api.goricompany.com/v1/auth/token", "json"),
+        ("https://api.goricompany.com/api/auth/token", "json"),
+        ("https://api.goricompany.com/auth/token", "form"),
+        ("https://staging.api.goricompany.com/auth/token", "json"),
+        ("https://app.goricompany.com/auth/token", "json"),
+        ("https://api.gori.ai/auth/token", "json"),
+        ("https://api.gori.ai/v2/auth/token", "json"),
+    ]
+    results = []
+    for url, mode in candidates:
+        try:
+            body = {
+                "client_id": gori_client.GORI_CLIENT_ID,
+                "client_secret": gori_client.GORI_CLIENT_SECRET,
+                "grant_type": "client_credentials",
+            }
+            if mode == "json":
+                resp = requests.post(url, json=body, timeout=15)
+            else:
+                resp = requests.post(url, data=body, timeout=15)
+            results.append({
+                "url": url, "mode": mode, "status": resp.status_code,
+                "body": resp.text[:300],
+            })
+        except Exception as e:
+            results.append({"url": url, "mode": mode, "error": str(e)})
+    return results
