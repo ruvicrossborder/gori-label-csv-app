@@ -208,6 +208,7 @@ async def preview(auth: bool = Depends(check_auth), file: UploadFile = File(...)
     total_original = 0.0
     total_gofo = 0.0
     priced_count = 0
+    rural_count = 0
 
     for row in rows:
         if row["error"]:
@@ -225,6 +226,12 @@ async def preview(auth: bool = Depends(check_auth), file: UploadFile = File(...)
             gofo_best = next((r for r in gofo_rates if r.get("carrier") == "gofo" and r.get("service") == "gofo_ground" and "fees" in r), None)
         except Exception:
             gofo_best = None
+
+        # GOFO's own service area excludes most rural/remote ZIPs, so a valid
+        # address that GOFO can't quote is a reliable proxy for "rural/hard to reach".
+        is_rural = bool(orig_best) and not gofo_best
+        if is_rural:
+            rural_count += 1
 
         orig_amount = orig_best["fees"]["amount"] if orig_best else None
         gofo_amount = gofo_best["fees"]["amount"] if gofo_best else None
@@ -245,6 +252,7 @@ async def preview(auth: bool = Depends(check_auth), file: UploadFile = File(...)
             "orig_service": orig_best.get("service") if orig_best else None,
             "orig_amount": orig_amount,
             "gofo_amount": gofo_amount,
+            "is_rural": is_rural,
             "error": None,
         })
 
@@ -255,17 +263,24 @@ async def preview(auth: bool = Depends(check_auth), file: UploadFile = File(...)
         if pr.get("error"):
             rows_html.append(
                 f"<tr><td>{pr['row_number']}</td><td>{pr.get('reference','')}</td>"
-                f"<td class='status-err' colspan='3'>{pr['error']}</td></tr>"
+                f"<td class='status-err' colspan='4'>{pr['error']}</td></tr>"
             )
             continue
         orig_txt = f"${pr['orig_amount']:.2f} ({pr.get('orig_service') or '?'})" if pr['orig_amount'] is not None else "—"
         gofo_txt = f"${pr['gofo_amount']:.2f}" if pr['gofo_amount'] is not None else "unavailable, uses fallback"
         row_savings = (pr['orig_amount'] - pr['gofo_amount']) if (pr['orig_amount'] is not None and pr['gofo_amount'] is not None) else None
         savings_txt = f"${row_savings:.2f}" if row_savings is not None else "—"
+        rural_txt = "<span class='badge other'>Rural / remote</span>" if pr.get("is_rural") else ""
         rows_html.append(
             f"<tr><td>{pr['row_number']}</td><td>{pr.get('reference','')}</td>"
-            f"<td>{orig_txt}</td><td>{gofo_txt}</td><td>{savings_txt}</td></tr>"
+            f"<td>{orig_txt}</td><td>{gofo_txt}</td><td>{savings_txt}</td><td>{rural_txt}</td></tr>"
         )
+
+    rural_note = (
+        f"<p class='muted' style='margin-top:10px'>Rural/remote flag is based on GOFO Ground not covering that address "
+        f"(GOFO's own service area excludes most rural ZIPs) — it's an estimate, not an official USPS/carrier rural designation.</p>"
+        if rural_count else ""
+    )
 
     html = PAGE_HEAD + f"""
     <div class="fade-in">
@@ -277,7 +292,9 @@ async def preview(auth: bool = Depends(check_auth), file: UploadFile = File(...)
       <div class="stat"><div class="label">At original weight/dims</div><div class="value">${total_original:.2f}</div></div>
       <div class="stat"><div class="label">Via GOFO Ground (4oz, 6x4x4)</div><div class="value">${total_gofo:.2f}</div></div>
       <div class="stat highlight"><div class="label">Estimated savings</div><div class="value">${savings:.2f}</div></div>
+      <div class="stat"><div class="label">Rural / remote ZIPs</div><div class="value">{rural_count}</div></div>
     </div>
+    {rural_note}
     <form action="/process" method="post" id="processForm">
     <input type="hidden" name="token" value="{token}">
     <button type="submit" id="processBtn">Create all labels</button>
@@ -288,7 +305,7 @@ async def preview(auth: bool = Depends(check_auth), file: UploadFile = File(...)
     <div class="card">
     <h2>Row-by-row</h2>
     <table>
-    <tr><th>Row</th><th>Ref</th><th>Original (cheapest carrier)</th><th>GOFO Ground</th><th>Savings</th></tr>
+    <tr><th>Row</th><th>Ref</th><th>Original (cheapest carrier)</th><th>GOFO Ground</th><th>Savings</th><th>Zone</th></tr>
     {''.join(rows_html)}
     </table>
     </div>
