@@ -237,47 +237,48 @@ def debug_rates(auth: bool = Depends(check_auth)):
     }
     url = "https://api.goricompany.com/v2/rates"
     results = []
-    base_headers = gori_client._headers()
 
-    # decode the JWT payload (no verification) so we can see what claims/account info it carries
-    try:
-        import base64 as _b64, json as _json2
-        token = base_headers["Authorization"].split(" ", 1)[1]
-        seg = token.split(".")[1]
-        seg += "=" * (-len(seg) % 4)
-        claims = _json2.loads(_b64.urlsafe_b64decode(seg))
-        results.append({"jwt_claims": claims})
-    except Exception as e:
-        results.append({"jwt_claims_error": str(e)})
+    # The default token comes back with "scopes": [] which explains the 500s -
+    # try requesting a token with an explicit scope and see if that changes anything.
+    def get_token_with_scope(scope_value):
+        body = {
+            "client_id": gori_client.GORI_CLIENT_ID,
+            "client_secret": gori_client.GORI_CLIENT_SECRET,
+            "grant_type": "client_credentials",
+        }
+        if scope_value is not None:
+            body["scope"] = scope_value
+        resp = requests.post(gori_client.GORI_AUTH_URL, json=body, timeout=15)
+        return resp
 
-    header_variants = {
-        "default": base_headers,
-        "with_ua_accept": {**base_headers, "User-Agent": "Mozilla/5.0 (compatible; GoriClient/1.0)", "Accept": "application/json"},
-        "with_ua_accept_2": {**base_headers, "User-Agent": "PostmanRuntime/7.36.0", "Accept": "*/*"},
-    }
+    import base64 as _b64, json as _json2
+
+    def decode_claims(token):
+        try:
+            seg = token.split(".")[1]
+            seg += "=" * (-len(seg) % 4)
+            return _json2.loads(_b64.urlsafe_b64decode(seg))
+        except Exception as e:
+            return {"decode_error": str(e)}
+
+    scope_variants = [None, "*", "rates shipments tracking refunds", "read write",
+                       "rates", "shipments:read shipments:write rates:read",
+                       "gori.rates gori.shipments", "full_access", "all"]
     body = body_variants["basic"]
-    for name, headers in header_variants.items():
+    for scope in scope_variants:
         try:
-            resp = requests.post(url, headers=headers, json=body, timeout=15)
-            results.append({"variant": name, "status": resp.status_code, "body": resp.text[:500]})
+            token_resp = get_token_with_scope(scope)
+            token_json = token_resp.json() if token_resp.status_code == 200 else {}
+            token = token_json.get("access_token")
+            claims = decode_claims(token) if token else None
+            entry = {"scope_requested": scope, "token_status": token_resp.status_code,
+                      "token_scopes_claim": claims.get("scopes") if isinstance(claims, dict) else claims}
+            if token:
+                rate_resp = requests.post(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=body, timeout=15)
+                entry["rate_status"] = rate_resp.status_code
+                entry["rate_body"] = rate_resp.text[:300]
+            results.append(entry)
         except Exception as e:
-            results.append({"variant": name, "error": str(e)})
-
-    # Try each body variant with the plain default headers too
-    for name, b in body_variants.items():
-        try:
-            resp = requests.post(url, headers=base_headers, json=b, timeout=15)
-            results.append({"variant": f"body_{name}", "status": resp.status_code, "body": resp.text[:500]})
-        except Exception as e:
-            results.append({"variant": f"body_{name}", "error": str(e)})
-
-    # Try compact JSON (no spaces) sent as raw data, in case of a body-size/parsing quirk
-    import json as _json
-    try:
-        compact = _json.dumps(body, separators=(",", ":"))
-        resp = requests.post(url, headers={**base_headers}, data=compact, timeout=15)
-        results.append({"variant": "compact_raw", "status": resp.status_code, "body": resp.text[:500]})
-    except Exception as e:
-        results.append({"variant": "compact_raw", "error": str(e)})
+            results.append({"scope_requested": scope, "error": str(e)})
 
     return results
