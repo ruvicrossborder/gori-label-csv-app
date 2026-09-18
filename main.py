@@ -217,33 +217,14 @@ def health():
 
 @app.get("/debug-rates")
 def debug_rates(auth: bool = Depends(check_auth)):
-    """Temporary diagnostic: test calling the gori-mcp server's own MCP endpoint
-    directly (server-to-server), since that server reliably gets real rates/labels
-    for the exact same inputs that fail against api.goricompany.com directly."""
+    """Temporary diagnostic: confirm gori_client.get_rates (via the gori-mcp
+    JSON-RPC proxy) returns real rates end-to-end."""
     to_address = {"street1": "316 Embrey Mill Rd", "city": "Stafford", "state": "VA", "zip": "22554-2577", "country": "US", "first_name": "Test", "last_name": "Test"}
     from_address = {"street1": "2550 Southwell Rd", "city": "Dallas", "state": "TX", "zip": "75229", "country": "US", "company": "SHIPPING DEPT"}
     parcel = {"length": 6, "width": 4, "height": 4, "weight": 4}
-
-    mcp_url = "https://gori-mcp-production.up.railway.app/mcp"
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "get_rates",
-            "arguments": {"to_address": to_address, "from_address": from_address, "parcel": parcel},
-        },
-    }
-    results = []
     try:
-        resp = requests.post(
-            mcp_url,
-            json=payload,
-            headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
-            timeout=30,
-        )
-        results.append({"variant": "gori-mcp tools/call get_rates", "status": resp.status_code, "content_type": resp.headers.get("content-type"), "body": resp.text[:2000]})
+        rates = gori_client.get_rates(to_address, from_address, parcel)
+        gofo = next((r for r in rates if r.get("carrier") == "gofo" and r.get("service") == "gofo_ground" and "fees" in r), None)
+        return {"ok": True, "num_rates": len(rates), "gofo_rate": gofo, "all_rates": rates}
     except Exception as e:
-        results.append({"variant": "gori-mcp tools/call get_rates", "error": str(e)})
-
-    return results
+        return {"ok": False, "error": str(e)}
